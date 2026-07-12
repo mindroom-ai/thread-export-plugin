@@ -136,6 +136,31 @@ async def test_message_triggers_coalesce_into_one_pass(tmp_path: Path) -> None:
         assert call.kwargs["prefer_cache"] is True
         assert call.kwargs["output_dir"] == expected_output_dir
         assert call.kwargs["required_member_user_id"] is None
+        assert call.kwargs["include_invited_rooms"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_mapping_settings_control_invited_rooms(tmp_path: Path) -> None:
+    """The mapping form of the agents setting should control invited-room export per agent."""
+    module = _load_hooks_module()
+    module.export_threads_once = AsyncMock(
+        return_value=Mock(rooms_exported=1, threads_exported=1, threads_unchanged=0, failures=0),
+    )
+    settings: dict[str, object] = {
+        "agents": {"code": {"invited_rooms": False}, "research": None},
+        "debounce_seconds": 0,
+    }
+
+    await module.queue_room_on_message(_message_ctx(tmp_path, "!alpha:hs", settings))
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    assert module.export_threads_once.await_count == 2
+    invited_by_agent = {
+        call.kwargs["output_dir"].parts[-3]: call.kwargs["include_invited_rooms"]
+        for call in module.export_threads_once.await_args_list
+    }
+    assert invited_by_agent == {"code": False, "research": True}
 
 
 @pytest.mark.asyncio

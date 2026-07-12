@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -22,7 +23,6 @@ from mindroom.tool_system.worker_routing import agent_workspace_root_path, priva
 from mindroom.workspaces import resolve_agent_workspace_from_state_path
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
     from pathlib import Path
 
     from structlog.stdlib import BoundLogger
@@ -61,13 +61,38 @@ class _ExportTarget:
     member_user_id: str | None = None
 
 
-def _requested_agents(settings: Mapping[str, object]) -> tuple[str, ...]:
-    """Return the deduplicated agent names listed in the plugin settings."""
+@dataclass(frozen=True)
+class _AgentExportSettings:
+    """Per-agent export options from the plugin settings."""
+
+    invited_rooms: bool = True
+
+
+def _agent_options(options: object) -> _AgentExportSettings:
+    """Parse one agent's option mapping, tolerating missing or bare entries."""
+    if not isinstance(options, Mapping):
+        return _AgentExportSettings()
+    invited_rooms = options.get("invited_rooms", True)
+    return _AgentExportSettings(invited_rooms=invited_rooms if isinstance(invited_rooms, bool) else True)
+
+
+def _requested_agents(settings: Mapping[str, object]) -> dict[str, _AgentExportSettings]:
+    """Return per-agent export options for the agents listed in the plugin settings.
+
+    ``agents`` accepts a plain list of names (all defaults) or a mapping of name to options
+    (currently ``invited_rooms``, default true).
+    """
     raw = settings.get("agents")
-    if not isinstance(raw, (list, tuple)):
-        return ()
-    names = [item.strip() for item in raw if isinstance(item, str) and item.strip()]
-    return tuple(dict.fromkeys(names))
+    parsed: dict[str, _AgentExportSettings] = {}
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                parsed.setdefault(item.strip(), _AgentExportSettings())
+    elif isinstance(raw, Mapping):
+        for name, options in raw.items():
+            if isinstance(name, str) and name.strip():
+                parsed.setdefault(name.strip(), _agent_options(options))
+    return parsed
 
 
 def _debounce_seconds(settings: Mapping[str, object]) -> float:
@@ -210,15 +235,17 @@ def _agent_export_targets(env: _TriggerEnv, agent_name: str) -> tuple[_ExportTar
 async def _run_export_pass(env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]) -> None:
     """Export the dirty rooms (or everything) into every enabled agent's workspace."""
     requested = _requested_agents(env.settings)
-    enabled = tuple(name for name in requested if name in env.config.agents)
+    enabled = {name: options for name, options in requested.items() if name in env.config.agents}
     unknown = tuple(name for name in requested if name not in env.config.agents)
     if unknown:
         env.logger.warning("thread-export settings list unknown agents", unknown_agents=list(unknown))
     room_filters: tuple[str | None, ...] = (None,) if full_pass else tuple(sorted(room_ids))
     targets = [
-        (agent_name, target) for agent_name in enabled for target in _agent_export_targets(env, agent_name)
+        (agent_name, target, options)
+        for agent_name, options in enabled.items()
+        for target in _agent_export_targets(env, agent_name)
     ]
-    for agent_name, target in targets:
+    for agent_name, target, options in targets:
         for room_filter in room_filters:
             try:
                 stats = await export_threads_once(
@@ -228,6 +255,7 @@ async def _run_export_pass(env: _TriggerEnv, *, full_pass: bool, room_ids: froze
                     room_filter=room_filter,
                     prefer_cache=True,
                     required_member_user_id=target.member_user_id,
+                    include_invited_rooms=options.invited_rooms,
                 )
             except Exception as exc:
                 env.logger.warning(

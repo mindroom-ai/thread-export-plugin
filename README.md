@@ -38,8 +38,21 @@ When enabled for an agent, every Matrix thread is continuously exported as a YAM
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `agents` | (none) | Agent names whose workspaces receive exports. Missing or empty disables the plugin |
+| `agents` | (none) | Agents whose workspaces receive exports: a list of names, or a mapping of name to per-agent options. Missing or empty disables the plugin |
+| `agents.<name>.invited_rooms` | `true` | Whether this agent's exports include rooms joined through invites (user-created rooms) |
 | `debounce_seconds` | `2` | Delay after the last trigger before an export pass runs |
+
+Per-agent options example:
+
+```yaml
+plugins:
+  - path: plugins/thread-export
+    settings:
+      agents:
+        code:
+          invited_rooms: false   # config rooms only
+        research: {}             # defaults: invited rooms included
+```
 
 ## Output Layout
 
