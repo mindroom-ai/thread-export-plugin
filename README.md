@@ -8,12 +8,12 @@
 
 Automatic Matrix thread exports for [MindRoom](https://github.com/mindroom-ai/mindroom) agents.
 
-When enabled for an agent, every Matrix thread is continuously exported as a YAML file into that agent's workspace at a predictable path, so the agent's file and shell tools can grep full conversation history without any Matrix API access.
+When enabled for an agent, threads from every Matrix room that agent is currently joined to are continuously exported as YAML files into its workspace at predictable paths, so the agent's file and shell tools can grep its conversation history without any Matrix API access.
 
 ## Features
 
-- Exports all rooms' threads into `<workspace>/thread_exports/<room>/<thread>.yaml` (the same layout as `mindroom threads export`)
-- Covers user-created rooms too: rooms agents joined via invite are exported with the invited agent's own account
+- Exports threads from every room the enabled agent is currently joined to into `<workspace>/thread_exports/<room>/<thread>.yaml` (the same layout as `mindroom threads export`)
+- Optionally covers user-created rooms too, while still requiring the enabled agent to be currently joined
 - Re-exports a room shortly after every message in it, plus one full pass at startup and after config hot reload
 - Cache-first: thread bodies are served from MindRoom's durable event cache, so passes barely touch the homeserver
 - Skip-unchanged writes: files are only rewritten when thread content actually changed
@@ -26,7 +26,7 @@ When enabled for an agent, every Matrix thread is continuously exported as a YAM
 1. `bot:ready` (router) queues one full export pass at startup.
 2. `config:reloaded` queues a full pass after hot reload, including cleanup for agents removed from the plugin settings.
 3. `message:received` and `message:after_response` mark the affected room dirty.
-4. A background runner debounces triggers, then reads each dirty room once and fans the result out to every authorized agent workspace.
+4. A background runner debounces triggers, then reads each dirty room once and fans the result out only to enabled agents that are currently joined.
 5. Unchanged thread files are left untouched, while vanished threads and unauthorized room directories are removed.
 
 ## Hooks
@@ -43,7 +43,7 @@ When enabled for an agent, every Matrix thread is continuously exported as a YAM
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `agents` | (none) | Agents whose workspaces receive exports: a list of names, or a mapping of name to per-agent options. Missing or empty disables the plugin |
-| `agents.<name>.invited_rooms` | `true` | Whether this agent's exports include rooms joined through invites (user-created rooms) |
+| `agents.<name>.invited_rooms` | `true` | Whether this agent's exports also consider rooms joined through invites (user-created rooms); current membership is always required |
 | `debounce_seconds` | `2` | Delay after the last trigger before an export pass runs |
 
 Per-agent options example:
@@ -76,7 +76,8 @@ Private agents (`private:` config) are supported: every existing private instanc
 
 Instances are discovered on disk, so a brand-new requester's instance starts receiving exports from the first pass after the instance is created.
 
-Private-instance exports are owner-scoped: each instance receives only rooms its owner is currently a member of, so one requester's private workspace never accumulates other users' conversations.
+Shared-agent exports are scoped to the enabled agent's current room memberships.
+Private-instance exports are scoped to the owner's current memberships, so one requester's private workspace never accumulates other users' conversations.
 Instance owners are resolved by matching instance directories against the Matrix user IDs in the `authorization` config; instances whose owner cannot be resolved have their prior exports removed and are skipped with a warning in the logs.
 Membership lookups that fail also fail closed: prior exports for that room are removed and the lookup is reported as a failure.
 
@@ -134,5 +135,5 @@ Notes:
 ## Notes
 
 - Cost profile: each pass performs one thread-list call per dirty room against the homeserver regardless of how many workspace targets receive it; thread bodies come from the local event cache.
-- Every enabled shared (non-private) agent receives a full copy of all rooms' threads; do not enable it for shared agents that should not see other rooms' conversations. Private agents are owner-scoped automatically.
+- Every shared and private export target is membership-scoped. The `invited_rooms` option only controls whether user-created invited rooms are considered; it never bypasses the membership check.
 - Agents may edit or delete their exported YAML files; deleted files are restored on the next pass that touches the room and on the next startup pass.

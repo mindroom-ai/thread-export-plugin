@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from mindroom.config.agent import AgentConfig
+from mindroom.config.main import Config
+from mindroom.constants import RuntimePaths
 from mindroom.hooks.decorators import get_hook_metadata
+from mindroom.matrix.identity import managed_account_key
+from mindroom.matrix.state import MatrixState
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -22,6 +27,7 @@ if TYPE_CHECKING:
 PACKAGE_NAME = (
     f"mindroom_plugin_{Path(__file__).resolve().parents[1].name.replace('-', '_')}"
 )
+_TEST_PASSWORD = "mock_test_password"  # noqa: S105
 
 
 def _load_hooks_module() -> ModuleType:
@@ -42,14 +48,46 @@ def _settings(agents: list[str] | None = None) -> dict[str, object]:
     return {"agents": agents or ["code"], "debounce_seconds": 0}
 
 
+def _shared_runtime(
+    tmp_path: Path,
+    agent_names: tuple[str, ...] = ("code", "research"),
+    *,
+    persisted_agent_names: tuple[str, ...] | None = None,
+) -> tuple[Config, RuntimePaths]:
+    """Build a shared-agent config with authoritative persisted Matrix identities."""
+    config = Config(
+        agents={
+            agent_name: AgentConfig(display_name=agent_name.title())
+            for agent_name in agent_names
+        },
+    )
+    runtime_paths = RuntimePaths(
+        config_path=tmp_path / "config.yaml",
+        config_dir=tmp_path,
+        env_path=tmp_path / ".env",
+        storage_root=tmp_path,
+    )
+    state = MatrixState()
+    persisted_names = (
+        agent_names if persisted_agent_names is None else persisted_agent_names
+    )
+    for agent_name in persisted_names:
+        state.add_account(
+            managed_account_key(agent_name),
+            f"mindroom_{agent_name}",
+            _TEST_PASSWORD,
+            domain="localhost",
+        )
+    state.save(runtime_paths)
+    return config, runtime_paths
+
+
 def _base_ctx(tmp_path: Path, settings: dict[str, object]) -> dict[str, object]:
-    shared_agent = SimpleNamespace(private=None)
+    config, runtime_paths = _shared_runtime(tmp_path)
     return {
         "settings": settings,
-        "config": SimpleNamespace(
-            agents={"code": shared_agent, "research": shared_agent}
-        ),
-        "runtime_paths": SimpleNamespace(storage_root=tmp_path),
+        "config": config,
+        "runtime_paths": runtime_paths,
         "logger": Mock(),
     }
 
@@ -184,7 +222,7 @@ async def test_message_triggers_coalesce_into_one_pass(tmp_path: Path) -> None:
         assert len(call.kwargs["targets"]) == 1
         target = call.kwargs["targets"][0]
         assert target.output_dir == expected_output_dir
-        assert target.required_member_user_id is None
+        assert target.required_member_user_id == "@mindroom_code:localhost"
         assert target.include_invited_rooms is True
 
 
@@ -204,10 +242,16 @@ async def test_agent_mapping_settings_control_invited_rooms(tmp_path: Path) -> N
 
     module.export_threads_to_targets_once.assert_awaited_once()
     invited_by_agent = {
-        target.output_dir.parts[-3]: target.include_invited_rooms
+        target.output_dir.parts[-3]: (
+            target.required_member_user_id,
+            target.include_invited_rooms,
+        )
         for target in module.export_threads_to_targets_once.await_args.kwargs["targets"]
     }
-    assert invited_by_agent == {"code": False, "research": True}
+    assert invited_by_agent == {
+        "code": ("@mindroom_code:localhost", False),
+        "research": ("@mindroom_research:localhost", True),
+    }
 
 
 @pytest.mark.asyncio
@@ -332,9 +376,10 @@ async def test_unknown_agents_are_warned_and_skipped(tmp_path: Path) -> None:
     module = _load_hooks_module()
     module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
     logger = Mock()
+    config, runtime_paths = _shared_runtime(tmp_path, ("code",))
     env = module._TriggerEnv(
-        config=SimpleNamespace(agents={"code": SimpleNamespace(private=None)}),
-        runtime_paths=SimpleNamespace(storage_root=tmp_path),
+        config=config,
+        runtime_paths=runtime_paths,
         settings={"agents": ["ghost", "code"]},
         logger=logger,
     )
@@ -360,14 +405,10 @@ async def test_full_pass_removes_exports_for_disabled_agents(tmp_path: Path) -> 
     )
     research_export_dir.mkdir(parents=True)
     (research_export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    config, runtime_paths = _shared_runtime(tmp_path)
     env = module._TriggerEnv(
-        config=SimpleNamespace(
-            agents={
-                "code": SimpleNamespace(private=None),
-                "research": SimpleNamespace(private=None),
-            },
-        ),
-        runtime_paths=SimpleNamespace(storage_root=tmp_path),
+        config=config,
+        runtime_paths=runtime_paths,
         settings={"agents": ["code"]},
         logger=Mock(),
     )
@@ -377,6 +418,39 @@ async def test_full_pass_removes_exports_for_disabled_agents(tmp_path: Path) -> 
     assert not research_export_dir.exists()
     targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
     assert [target.output_dir.parts[-3] for target in targets] == ["code"]
+
+
+@pytest.mark.asyncio
+async def test_shared_agent_without_persisted_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A missing shared-agent account should remove prior exports instead of widening access."""
+    module = _load_hooks_module()
+    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    export_dir = tmp_path / "agents" / "code" / "workspace" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    config, runtime_paths = _shared_runtime(
+        tmp_path,
+        ("code",),
+        persisted_agent_names=(),
+    )
+    logger = Mock()
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["code"]},
+        logger=logger,
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert not export_dir.exists()
+    assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
+    logger.warning.assert_called_once_with(
+        "Skipping shared agent without persisted Matrix account",
+        agent_name="code",
+    )
 
 
 @pytest.mark.asyncio

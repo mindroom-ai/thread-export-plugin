@@ -25,6 +25,7 @@ from mindroom.hooks import (
     MessageReceivedContext,
     hook,
 )
+from mindroom.matrix.identity import managed_account_key, managed_account_user_id
 from mindroom.thread_export import ThreadExportTarget, export_threads_to_targets_once
 from mindroom.tool_system.worker_routing import (
     agent_workspace_root_path,
@@ -253,9 +254,23 @@ def _agent_export_targets(
         workspace_dir = agent_workspace_root_path(
             env.runtime_paths.storage_root, agent_name
         )
+        output_dir = workspace_dir / WORKSPACE_EXPORT_DIRNAME
+        agent_user_id = managed_account_user_id(
+            managed_account_key(agent_name),
+            env.config.get_domain(env.runtime_paths),
+            env.runtime_paths,
+        )
+        if agent_user_id is None:
+            _remove_export_tree(output_dir)
+            env.logger.warning(
+                "Skipping shared agent without persisted Matrix account",
+                agent_name=agent_name,
+            )
+            return ()
         return (
             ThreadExportTarget(
-                output_dir=workspace_dir / WORKSPACE_EXPORT_DIRNAME,
+                output_dir=output_dir,
+                required_member_user_id=agent_user_id,
                 include_invited_rooms=include_invited_rooms,
             ),
         )
