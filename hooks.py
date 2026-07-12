@@ -12,14 +12,24 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from mindroom.constants import ROUTER_AGENT_NAME
-from mindroom.hooks import AfterResponseContext, AgentLifecycleContext, MessageReceivedContext, hook
-from mindroom.thread_export import export_threads_once
-from mindroom.tool_system.worker_routing import agent_workspace_root_path, private_instance_state_root_for_requester
+from mindroom.hooks import (
+    AfterResponseContext,
+    AgentLifecycleContext,
+    ConfigReloadedContext,
+    MessageReceivedContext,
+    hook,
+)
+from mindroom.thread_export import ThreadExportTarget, export_threads_to_targets_once
+from mindroom.tool_system.worker_routing import (
+    agent_workspace_root_path,
+    private_instance_state_root_for_requester,
+)
 from mindroom.workspaces import resolve_agent_workspace_from_state_path
 
 if TYPE_CHECKING:
@@ -54,14 +64,6 @@ class _TriggerEnv:
 
 
 @dataclass(frozen=True)
-class _ExportTarget:
-    """One export destination and its optional room-membership scope."""
-
-    output_dir: Path
-    member_user_id: str | None = None
-
-
-@dataclass(frozen=True)
 class _AgentExportSettings:
     """Per-agent export options from the plugin settings."""
 
@@ -73,10 +75,14 @@ def _agent_options(options: object) -> _AgentExportSettings:
     if not isinstance(options, Mapping):
         return _AgentExportSettings()
     invited_rooms = options.get("invited_rooms", True)
-    return _AgentExportSettings(invited_rooms=invited_rooms if isinstance(invited_rooms, bool) else True)
+    return _AgentExportSettings(
+        invited_rooms=invited_rooms if isinstance(invited_rooms, bool) else True
+    )
 
 
-def _requested_agents(settings: Mapping[str, object]) -> dict[str, _AgentExportSettings]:
+def _requested_agents(
+    settings: Mapping[str, object],
+) -> dict[str, _AgentExportSettings]:
     """Return per-agent export options for the agents listed in the plugin settings.
 
     ``agents`` accepts a plain list of names (all defaults) or a mapping of name to options
@@ -116,7 +122,9 @@ def _record_trigger(ctx: HookContext) -> None:
         _wakeup = asyncio.Event()
     runner = _runner_tasks.get("runner")
     if runner is None or runner.done():
-        _runner_tasks["runner"] = asyncio.create_task(_run_export_loop(), name="thread-export-runner")
+        _runner_tasks["runner"] = asyncio.create_task(
+            _run_export_loop(), name="thread-export-runner"
+        )
     _wakeup.set()
 
 
@@ -152,7 +160,9 @@ async def _run_export_loop() -> None:
             env.logger.exception("Thread export pass crashed")
 
 
-def _private_instance_state_roots(storage_root: Path, agent_name: str) -> tuple[Path, ...]:
+def _private_instance_state_roots(
+    storage_root: Path, agent_name: str
+) -> tuple[Path, ...]:
     """Return existing private-instance state roots for one private agent."""
     instances_root = storage_root / PRIVATE_INSTANCES_DIRNAME
     if not instances_root.is_dir():
@@ -173,13 +183,21 @@ def _authorized_requester_candidates(config: Config) -> tuple[str, ...]:
     raw = [
         *authorization.global_users,
         *(user for users in authorization.room_permissions.values() for user in users),
-        *(user for users in authorization.agent_reply_permissions.values() for user in users),
+        *(
+            user
+            for users in authorization.agent_reply_permissions.values()
+            for user in users
+        ),
         *authorization.aliases,
     ]
-    return tuple(dict.fromkeys(user for user in raw if _MATRIX_USER_ID_PATTERN.fullmatch(user)))
+    return tuple(
+        dict.fromkeys(user for user in raw if _MATRIX_USER_ID_PATTERN.fullmatch(user))
+    )
 
 
-def _private_instance_owners(env: _TriggerEnv, agent_name: str, worker_scope: str) -> dict[Path, str]:
+def _private_instance_owners(
+    env: _TriggerEnv, agent_name: str, worker_scope: str
+) -> dict[Path, str]:
     """Map existing private-instance state roots to the authorized requester that owns them."""
     owners: dict[Path, str] = {}
     for requester_id in _authorized_requester_candidates(env.config):
@@ -195,7 +213,34 @@ def _private_instance_owners(env: _TriggerEnv, agent_name: str, worker_scope: st
     return owners
 
 
-def _agent_export_targets(env: _TriggerEnv, agent_name: str) -> tuple[_ExportTarget, ...]:
+def _remove_export_tree(output_dir: Path) -> None:
+    """Remove one plugin-owned export tree when its scope is revoked."""
+    if output_dir.is_symlink() or output_dir.is_file():
+        output_dir.unlink()
+    elif output_dir.is_dir():
+        shutil.rmtree(output_dir)
+
+
+def _private_workspace_export_dir(
+    env: _TriggerEnv, agent_name: str, state_root: Path
+) -> Path | None:
+    """Resolve one private instance's plugin-owned export directory."""
+    workspace = resolve_agent_workspace_from_state_path(
+        agent_name,
+        env.config,
+        runtime_paths=env.runtime_paths,
+        state_storage_path=state_root,
+        use_state_storage_path=True,
+    )
+    return workspace.root / WORKSPACE_EXPORT_DIRNAME if workspace is not None else None
+
+
+def _agent_export_targets(
+    env: _TriggerEnv,
+    agent_name: str,
+    *,
+    include_invited_rooms: bool,
+) -> tuple[ThreadExportTarget, ...]:
     """Return export targets for one agent: shared workspace, or one owner-scoped target per instance.
 
     Private instances export only rooms their owner is a member of; instances whose owner cannot be
@@ -205,66 +250,112 @@ def _agent_export_targets(env: _TriggerEnv, agent_name: str) -> tuple[_ExportTar
     if agent_config is None:
         return ()
     if agent_config.private is None:
-        workspace_dir = agent_workspace_root_path(env.runtime_paths.storage_root, agent_name)
-        return (_ExportTarget(output_dir=workspace_dir / WORKSPACE_EXPORT_DIRNAME, member_user_id=None),)
+        workspace_dir = agent_workspace_root_path(
+            env.runtime_paths.storage_root, agent_name
+        )
+        return (
+            ThreadExportTarget(
+                output_dir=workspace_dir / WORKSPACE_EXPORT_DIRNAME,
+                include_invited_rooms=include_invited_rooms,
+            ),
+        )
     owners = _private_instance_owners(env, agent_name, agent_config.private.per)
-    targets: list[_ExportTarget] = []
-    for state_root in _private_instance_state_roots(env.runtime_paths.storage_root, agent_name):
+    targets: list[ThreadExportTarget] = []
+    for state_root in _private_instance_state_roots(
+        env.runtime_paths.storage_root, agent_name
+    ):
+        output_dir = _private_workspace_export_dir(env, agent_name, state_root)
+        if output_dir is None:
+            continue
         owner = owners.get(state_root.resolve())
         if owner is None:
+            _remove_export_tree(output_dir)
             env.logger.warning(
                 "Skipping private instance without resolvable owner",
                 agent_name=agent_name,
                 instance_root=str(state_root),
             )
             continue
-        workspace = resolve_agent_workspace_from_state_path(
-            agent_name,
-            env.config,
-            runtime_paths=env.runtime_paths,
-            state_storage_path=state_root,
-            use_state_storage_path=True,
+        targets.append(
+            ThreadExportTarget(
+                output_dir=output_dir,
+                required_member_user_id=owner,
+                include_invited_rooms=include_invited_rooms,
+            ),
         )
-        if workspace is not None:
-            targets.append(
-                _ExportTarget(output_dir=workspace.root / WORKSPACE_EXPORT_DIRNAME, member_user_id=owner),
-            )
     return tuple(targets)
 
 
-async def _run_export_pass(env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]) -> None:
+def _cleanup_disabled_agent_exports(
+    env: _TriggerEnv, enabled_agent_names: set[str]
+) -> None:
+    """Remove plugin-owned exports for configured agents no longer enabled in settings."""
+    for agent_name, agent_config in env.config.agents.items():
+        if agent_name in enabled_agent_names:
+            continue
+        if agent_config.private is None:
+            workspace_dir = agent_workspace_root_path(
+                env.runtime_paths.storage_root, agent_name
+            )
+            _remove_export_tree(workspace_dir / WORKSPACE_EXPORT_DIRNAME)
+            continue
+        for state_root in _private_instance_state_roots(
+            env.runtime_paths.storage_root, agent_name
+        ):
+            output_dir = _private_workspace_export_dir(env, agent_name, state_root)
+            if output_dir is not None:
+                _remove_export_tree(output_dir)
+
+
+async def _run_export_pass(
+    env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
+) -> None:
     """Export the dirty rooms (or everything) into every enabled agent's workspace."""
     requested = _requested_agents(env.settings)
-    enabled = {name: options for name, options in requested.items() if name in env.config.agents}
+    enabled = {
+        name: options
+        for name, options in requested.items()
+        if name in env.config.agents
+    }
     unknown = tuple(name for name in requested if name not in env.config.agents)
     if unknown:
-        env.logger.warning("thread-export settings list unknown agents", unknown_agents=list(unknown))
-    room_filters: tuple[str | None, ...] = (None,) if full_pass else tuple(sorted(room_ids))
-    targets = [
+        env.logger.warning(
+            "thread-export settings list unknown agents", unknown_agents=list(unknown)
+        )
+    room_filters: tuple[str | None, ...] = (
+        (None,) if full_pass else tuple(sorted(room_ids))
+    )
+    if full_pass:
+        _cleanup_disabled_agent_exports(env, set(enabled))
+    target_records = [
         (agent_name, target, options)
         for agent_name, options in enabled.items()
-        for target in _agent_export_targets(env, agent_name)
+        for target in _agent_export_targets(
+            env,
+            agent_name,
+            include_invited_rooms=options.invited_rooms,
+        )
     ]
-    for agent_name, target, options in targets:
-        for room_filter in room_filters:
-            try:
-                stats = await export_threads_once(
-                    config=env.config,
-                    runtime_paths=env.runtime_paths,
-                    output_dir=target.output_dir,
-                    room_filter=room_filter,
-                    prefer_cache=True,
-                    required_member_user_id=target.member_user_id,
-                    include_invited_rooms=options.invited_rooms,
-                )
-            except Exception as exc:
-                env.logger.warning(
-                    "Thread export pass failed",
-                    agent_name=agent_name,
-                    room_filter=room_filter,
-                    error=str(exc),
-                )
-                continue
+    targets = tuple(target for _, target, _ in target_records)
+    for room_filter in room_filters:
+        try:
+            target_stats = await export_threads_to_targets_once(
+                config=env.config,
+                runtime_paths=env.runtime_paths,
+                targets=targets,
+                room_filter=room_filter,
+                prefer_cache=True,
+            )
+        except Exception as exc:
+            env.logger.warning(
+                "Thread export pass failed",
+                room_filter=room_filter,
+                error=str(exc),
+            )
+            continue
+        for (agent_name, _target, _options), stats in zip(
+            target_records, target_stats, strict=True
+        ):
             env.logger.info(
                 "Exported threads to agent workspace",
                 agent_name=agent_name,
@@ -279,8 +370,14 @@ async def _run_export_pass(env: _TriggerEnv, *, full_pass: bool, room_ids: froze
 @hook(event="bot:ready", name="thread-export-startup", agents=(ROUTER_AGENT_NAME,))
 async def queue_initial_full_pass(ctx: AgentLifecycleContext) -> None:
     """Queue one full export pass once the router bot is ready."""
-    if not _requested_agents(ctx.settings):
-        return
+    global _full_pass_pending  # noqa: PLW0603
+    _full_pass_pending = True
+    _record_trigger(ctx)
+
+
+@hook(event="config:reloaded", name="thread-export-config-reloaded", timeout_ms=1000)
+async def queue_full_pass_after_config_reload(ctx: ConfigReloadedContext) -> None:
+    """Queue a full pass after hot reload, including cleanup for removed agent settings."""
     global _full_pass_pending  # noqa: PLW0603
     _full_pass_pending = True
     _record_trigger(ctx)
@@ -295,7 +392,9 @@ async def queue_room_on_message(ctx: MessageReceivedContext) -> None:
     _record_trigger(ctx)
 
 
-@hook(event="message:after_response", name="thread-export-after-response", timeout_ms=1000)
+@hook(
+    event="message:after_response", name="thread-export-after-response", timeout_ms=1000
+)
 async def queue_room_after_response(ctx: AfterResponseContext) -> None:
     """Queue the responded room for re-export."""
     if not _requested_agents(ctx.settings):

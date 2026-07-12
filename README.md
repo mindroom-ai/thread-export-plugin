@@ -14,23 +14,27 @@ When enabled for an agent, every Matrix thread is continuously exported as a YAM
 
 - Exports all rooms' threads into `<workspace>/thread_exports/<room>/<thread>.yaml` (the same layout as `mindroom threads export`)
 - Covers user-created rooms too: rooms agents joined via invite are exported with the invited agent's own account
-- Re-exports a room shortly after every message in it, plus one full pass at startup
+- Re-exports a room shortly after every message in it, plus one full pass at startup and after config hot reload
 - Cache-first: thread bodies are served from MindRoom's durable event cache, so passes barely touch the homeserver
 - Skip-unchanged writes: files are only rewritten when thread content actually changed
+- Reconciles removed threads and revoked room access so stale exports do not survive
+- Fetches each source thread once and fans it out to every authorized workspace
 - Debounced single-flight runner: bursts of messages coalesce into one export pass
 
 ## How It Works
 
 1. `bot:ready` (router) queues one full export pass at startup.
-2. `message:received` and `message:after_response` mark the affected room dirty.
-3. A background runner debounces triggers, then runs `export_threads_once(prefer_cache=True)` for each dirty room into every enabled agent's workspace.
-4. Unchanged thread files are left untouched, so `exported_at` reflects the last content change.
+2. `config:reloaded` queues a full pass after hot reload, including cleanup for agents removed from the plugin settings.
+3. `message:received` and `message:after_response` mark the affected room dirty.
+4. A background runner debounces triggers, then reads each dirty room once and fans the result out to every authorized agent workspace.
+5. Unchanged thread files are left untouched, while vanished threads and unauthorized room directories are removed.
 
 ## Hooks
 
 | Hook | Event | Purpose |
 |------|-------|---------|
 | `thread-export-startup` | `bot:ready` | Queue one full export pass once the router is ready |
+| `thread-export-config-reloaded` | `config:reloaded` | Queue one full export pass after config hot reload |
 | `thread-export-on-message` | `message:received` | Mark the message's room dirty |
 | `thread-export-after-response` | `message:after_response` | Mark the responded room dirty |
 
@@ -73,8 +77,8 @@ Private agents (`private:` config) are supported: every existing private instanc
 Instances are discovered on disk, so a brand-new requester's instance starts receiving exports from the first pass after the instance is created.
 
 Private-instance exports are owner-scoped: each instance receives only rooms its owner is currently a member of, so one requester's private workspace never accumulates other users' conversations.
-Instance owners are resolved by matching instance directories against the Matrix user IDs in the `authorization` config; instances whose owner cannot be resolved are skipped entirely (fail closed) with a warning in the logs.
-Membership lookups that fail also fail closed: the room is skipped and reported as a failure rather than exported.
+Instance owners are resolved by matching instance directories against the Matrix user IDs in the `authorization` config; instances whose owner cannot be resolved have their prior exports removed and are skipped with a warning in the logs.
+Membership lookups that fail also fail closed: prior exports for that room are removed and the lookup is reported as a failure.
 
 ## Semantic Search Over Exports
 
@@ -129,6 +133,6 @@ Notes:
 
 ## Notes
 
-- Cost profile: each pass performs one thread-list call per dirty room against the homeserver; thread bodies come from the local event cache.
+- Cost profile: each pass performs one thread-list call per dirty room against the homeserver regardless of how many workspace targets receive it; thread bodies come from the local event cache.
 - Every enabled shared (non-private) agent receives a full copy of all rooms' threads; do not enable it for shared agents that should not see other rooms' conversations. Private agents are owner-scoped automatically.
 - Agents may edit or delete their exported YAML files; deleted files are restored on the next pass that touches the room and on the next startup pass.
