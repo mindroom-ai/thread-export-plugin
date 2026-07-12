@@ -1,0 +1,4 @@
+{
+  "name": "thread-export",
+  "hooks_module": "hooks.py"
+}
