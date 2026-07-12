@@ -13,6 +13,7 @@ When enabled for an agent, every Matrix thread is continuously exported as a YAM
 ## Features
 
 - Exports all rooms' threads into `<workspace>/thread_exports/<room>/<thread>.yaml` (the same layout as `mindroom threads export`)
+- Covers user-created rooms too: rooms agents joined via invite are exported with the invited agent's own account
 - Re-exports a room shortly after every message in it, plus one full pass at startup
 - Cache-first: thread bodies are served from MindRoom's durable event cache, so passes barely touch the homeserver
 - Skip-unchanged writes: files are only rewritten when thread content actually changed
@@ -71,8 +72,6 @@ Instances are discovered on disk, so a brand-new requester's instance starts rec
    ```
 
 3. Restart MindRoom (or let config hot reload pick it up).
-
-Requires a MindRoom version with `export_threads_once(prefer_cache=...)` support.
 
 ## Notes
 
