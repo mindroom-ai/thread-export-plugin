@@ -48,7 +48,8 @@ When enabled for an agent, every Matrix thread is continuously exported as a YAM
 ```
 
 Inside the agent's own tools this is `$MINDROOM_AGENT_WORKSPACE/thread_exports/` (the workspace is the agent's `$HOME`).
-Each file is the standard thread export document: `version`, `room` metadata, `thread` metadata, and a `messages` list.
+Each file is the standard thread export document: `version`, `room` metadata, `thread` metadata (including the latest MindRoom thread summary as `thread.summary`), and a `messages` list.
+Each room directory also contains an `index.json` mapping every thread file to its message count, participants, latest summary, and last activity, sorted by most recent activity, so agents can navigate a room without opening every thread file.
 
 Private agents (`private:` config) are supported: every existing private instance gets its own copy under its requester-scoped workspace:
 
