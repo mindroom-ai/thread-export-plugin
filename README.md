@@ -76,6 +76,42 @@ Private-instance exports are owner-scoped: each instance receives only rooms its
 Instance owners are resolved by matching instance directories against the Matrix user IDs in the `authorization` config; instances whose owner cannot be resolved are skipped entirely (fail closed) with a warning in the logs.
 Membership lookups that fail also fail closed: the room is skipped and reported as a failure rather than exported.
 
+## Semantic Search Over Exports
+
+Without any extra config, agents already have file-based search: the exports are plain YAML in the agent's workspace, and each room's `index.json` maps threads to participants and summaries, so `grep`/`read` file tools cover keyword search.
+
+With an embedder configured (`memory.embedder`), point a knowledge base at the export directory to get semantic search through the standard `search_knowledge_base` tool.
+
+Shared agent (paths resolve against the config.yaml directory; default storage is `./mindroom_data`):
+
+```yaml
+knowledge_bases:
+  code_threads:
+    path: ./mindroom_data/agents/code/workspace/thread_exports
+    description: Exported Matrix conversation history for the code agent
+agents:
+  code:
+    knowledge_bases: [code_threads]
+```
+
+Private agent (each instance indexes its own owner-scoped exports; `path` is relative to the private root):
+
+```yaml
+agents:
+  secret:
+    private:
+      per: user
+      knowledge:
+        path: thread_exports
+        description: Your exported conversation history
+```
+
+Notes:
+
+- `mode: semantic` is the knowledge-base default; `.yaml` and `.json` are in the default indexed extension set, so no extension config is needed.
+- The active thread's file rewrites on every message, so a watching semantic index re-embeds that thread per message. This is negligible with a local embedder (Ollama, sentence-transformers) but costs real money with paid embedding APIs in busy rooms.
+- Add `exclude_patterns: ["*/index.json"]` to the knowledge base if you prefer to keep the room indexes out of the semantic index.
+
 ## Setup
 
 1. Copy this plugin to `~/.mindroom/plugins/thread-export` (or reference it by relative path).
