@@ -135,6 +135,7 @@ async def test_message_triggers_coalesce_into_one_pass(tmp_path: Path) -> None:
     for call in module.export_threads_once.await_args_list:
         assert call.kwargs["prefer_cache"] is True
         assert call.kwargs["output_dir"] == expected_output_dir
+        assert call.kwargs["required_member_user_id"] is None
 
 
 @pytest.mark.asyncio
@@ -249,34 +250,51 @@ async def test_unknown_agents_are_warned_and_skipped(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_private_agent_exports_into_each_instance_workspace(tmp_path: Path) -> None:
-    """A private agent should get one export per existing private instance workspace."""
+async def test_private_agent_exports_scoped_to_resolved_owners(tmp_path: Path) -> None:
+    """Private instances should export only for resolvable owners, scoped to the owner's rooms."""
     from mindroom.config.agent import AgentConfig, AgentPrivateConfig
+    from mindroom.config.auth import AuthorizationConfig
     from mindroom.config.main import Config
+    from mindroom.tool_system.worker_routing import private_instance_state_root_for_requester
 
     module = _load_hooks_module()
     module.export_threads_once = AsyncMock(return_value=Mock(rooms_exported=1, threads_exported=1, threads_unchanged=0, failures=0))
     config = Config(
         agents={"secret": AgentConfig(display_name="Secret", private=AgentPrivateConfig(per="user"))},
+        authorization=AuthorizationConfig(global_users=["@alice:hs", "@bob:hs"]),
     )
-    for scope_dir_name, agent_dir_name in (
-        ("alice-1111111111111111", "secret"),
-        ("bob-2222222222222222", "secret"),
-        ("carol-3333333333333333", "other"),
-    ):
-        (tmp_path / "private_instances" / scope_dir_name / agent_dir_name).mkdir(parents=True)
+    runtime_paths = SimpleNamespace(storage_root=tmp_path, env_value=lambda _name, default=None: default)
+    expected_dirs = {}
+    for requester_id in ("@alice:hs", "@bob:hs"):
+        instance_root = private_instance_state_root_for_requester(
+            tmp_path,
+            requester_id=requester_id,
+            agent_name="secret",
+            worker_scope="user",
+            runtime_paths=runtime_paths,
+        )
+        assert instance_root is not None
+        instance_root.mkdir(parents=True)
+        expected_dirs[requester_id] = instance_root / "secret_data" / "thread_exports"
+    (tmp_path / "private_instances" / "ghost-0000000000000000" / "secret").mkdir(parents=True)
+    logger = Mock()
     env = module._TriggerEnv(
         config=config,
-        runtime_paths=SimpleNamespace(storage_root=tmp_path),
+        runtime_paths=runtime_paths,
         settings={"agents": ["secret"]},
-        logger=Mock(),
+        logger=logger,
     )
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
     assert module.export_threads_once.await_count == 2
-    output_dirs = {call.kwargs["output_dir"] for call in module.export_threads_once.await_args_list}
-    assert output_dirs == {
-        tmp_path / "private_instances" / "alice-1111111111111111" / "secret" / "secret_data" / "thread_exports",
-        tmp_path / "private_instances" / "bob-2222222222222222" / "secret" / "secret_data" / "thread_exports",
+    exported = {
+        call.kwargs["required_member_user_id"]: call.kwargs["output_dir"]
+        for call in module.export_threads_once.await_args_list
     }
+    assert exported == expected_dirs
+    orphan_warnings = [
+        call for call in logger.warning.call_args_list if "without resolvable owner" in call.args[0]
+    ]
+    assert len(orphan_warnings) == 1
+    assert "ghost-0000000000000000" in orphan_warnings[0].kwargs["instance_root"]

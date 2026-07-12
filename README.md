@@ -59,6 +59,10 @@ Private agents (`private:` config) are supported: every existing private instanc
 
 Instances are discovered on disk, so a brand-new requester's instance starts receiving exports from the first pass after the instance is created.
 
+Private-instance exports are owner-scoped: each instance receives only rooms its owner is currently a member of, so one requester's private workspace never accumulates other users' conversations.
+Instance owners are resolved by matching instance directories against the Matrix user IDs in the `authorization` config; instances whose owner cannot be resolved are skipped entirely (fail closed) with a warning in the logs.
+Membership lookups that fail also fail closed: the room is skipped and reported as a failure rather than exported.
+
 ## Setup
 
 1. Copy this plugin to `~/.mindroom/plugins/thread-export` (or reference it by relative path).
@@ -77,5 +81,5 @@ Instances are discovered on disk, so a brand-new requester's instance starts rec
 ## Notes
 
 - Cost profile: each pass performs one thread-list call per dirty room against the homeserver; thread bodies come from the local event cache.
-- Every enabled agent receives a full copy of all rooms' threads; do not enable it for agents that should not see other rooms' conversations.
+- Every enabled shared (non-private) agent receives a full copy of all rooms' threads; do not enable it for shared agents that should not see other rooms' conversations. Private agents are owner-scoped automatically.
 - Agents may edit or delete their exported YAML files; deleted files are restored on the next pass that touches the room and on the next startup pass.

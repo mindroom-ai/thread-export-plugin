@@ -11,13 +11,14 @@ cancels tasks it finds in module globals or one level inside a global dict/list/
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.hooks import AfterResponseContext, AgentLifecycleContext, MessageReceivedContext, hook
 from mindroom.thread_export import export_threads_once
-from mindroom.tool_system.worker_routing import agent_workspace_root_path
+from mindroom.tool_system.worker_routing import agent_workspace_root_path, private_instance_state_root_for_requester
 from mindroom.workspaces import resolve_agent_workspace_from_state_path
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 WORKSPACE_EXPORT_DIRNAME = "thread_exports"
 PRIVATE_INSTANCES_DIRNAME = "private_instances"
 DEFAULT_DEBOUNCE_SECONDS = 2.0
+_MATRIX_USER_ID_PATTERN = re.compile(r"@[^:\s]+:\S+")
 
 _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
@@ -49,6 +51,14 @@ class _TriggerEnv:
     runtime_paths: RuntimePaths
     settings: Mapping[str, object]
     logger: BoundLogger
+
+
+@dataclass(frozen=True)
+class _ExportTarget:
+    """One export destination and its optional room-membership scope."""
+
+    output_dir: Path
+    member_user_id: str | None = None
 
 
 def _requested_agents(settings: Mapping[str, object]) -> tuple[str, ...]:
@@ -132,15 +142,57 @@ def _private_instance_state_roots(storage_root: Path, agent_name: str) -> tuple[
     )
 
 
-def _agent_export_dirs(env: _TriggerEnv, agent_name: str) -> tuple[Path, ...]:
-    """Return the export target dirs for one agent: shared workspace, or one per private instance."""
+def _authorized_requester_candidates(config: Config) -> tuple[str, ...]:
+    """Return authorized Matrix user IDs that may own private agent instances."""
+    authorization = config.authorization
+    raw = [
+        *authorization.global_users,
+        *(user for users in authorization.room_permissions.values() for user in users),
+        *(user for users in authorization.agent_reply_permissions.values() for user in users),
+        *authorization.aliases,
+    ]
+    return tuple(dict.fromkeys(user for user in raw if _MATRIX_USER_ID_PATTERN.fullmatch(user)))
+
+
+def _private_instance_owners(env: _TriggerEnv, agent_name: str, worker_scope: str) -> dict[Path, str]:
+    """Map existing private-instance state roots to the authorized requester that owns them."""
+    owners: dict[Path, str] = {}
+    for requester_id in _authorized_requester_candidates(env.config):
+        candidate_root = private_instance_state_root_for_requester(
+            env.runtime_paths.storage_root,
+            requester_id=requester_id,
+            agent_name=agent_name,
+            worker_scope=worker_scope,
+            runtime_paths=env.runtime_paths,
+        )
+        if candidate_root is not None:
+            owners[candidate_root.resolve()] = requester_id
+    return owners
+
+
+def _agent_export_targets(env: _TriggerEnv, agent_name: str) -> tuple[_ExportTarget, ...]:
+    """Return export targets for one agent: shared workspace, or one owner-scoped target per instance.
+
+    Private instances export only rooms their owner is a member of; instances whose owner cannot be
+    resolved from the authorization config are skipped entirely (fail closed).
+    """
     agent_config = env.config.agents.get(agent_name)
     if agent_config is None:
         return ()
     if agent_config.private is None:
-        return (agent_workspace_root_path(env.runtime_paths.storage_root, agent_name) / WORKSPACE_EXPORT_DIRNAME,)
-    export_dirs: list[Path] = []
+        workspace_dir = agent_workspace_root_path(env.runtime_paths.storage_root, agent_name)
+        return (_ExportTarget(output_dir=workspace_dir / WORKSPACE_EXPORT_DIRNAME, member_user_id=None),)
+    owners = _private_instance_owners(env, agent_name, agent_config.private.per)
+    targets: list[_ExportTarget] = []
     for state_root in _private_instance_state_roots(env.runtime_paths.storage_root, agent_name):
+        owner = owners.get(state_root.resolve())
+        if owner is None:
+            env.logger.warning(
+                "Skipping private instance without resolvable owner",
+                agent_name=agent_name,
+                instance_root=str(state_root),
+            )
+            continue
         workspace = resolve_agent_workspace_from_state_path(
             agent_name,
             env.config,
@@ -149,8 +201,10 @@ def _agent_export_dirs(env: _TriggerEnv, agent_name: str) -> tuple[Path, ...]:
             use_state_storage_path=True,
         )
         if workspace is not None:
-            export_dirs.append(workspace.root / WORKSPACE_EXPORT_DIRNAME)
-    return tuple(export_dirs)
+            targets.append(
+                _ExportTarget(output_dir=workspace.root / WORKSPACE_EXPORT_DIRNAME, member_user_id=owner),
+            )
+    return tuple(targets)
 
 
 async def _run_export_pass(env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]) -> None:
@@ -162,17 +216,18 @@ async def _run_export_pass(env: _TriggerEnv, *, full_pass: bool, room_ids: froze
         env.logger.warning("thread-export settings list unknown agents", unknown_agents=list(unknown))
     room_filters: tuple[str | None, ...] = (None,) if full_pass else tuple(sorted(room_ids))
     targets = [
-        (agent_name, output_dir) for agent_name in enabled for output_dir in _agent_export_dirs(env, agent_name)
+        (agent_name, target) for agent_name in enabled for target in _agent_export_targets(env, agent_name)
     ]
-    for agent_name, output_dir in targets:
+    for agent_name, target in targets:
         for room_filter in room_filters:
             try:
                 stats = await export_threads_once(
                     config=env.config,
                     runtime_paths=env.runtime_paths,
-                    output_dir=output_dir,
+                    output_dir=target.output_dir,
                     room_filter=room_filter,
                     prefer_cache=True,
+                    required_member_user_id=target.member_user_id,
                 )
             except Exception as exc:
                 env.logger.warning(
