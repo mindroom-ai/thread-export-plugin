@@ -4,6 +4,9 @@
 Message hooks only record which room changed; one module-global runner task debounces triggers and
 runs cache-first export passes (``export_threads_once(prefer_cache=True)``) into every enabled
 agent's workspace, so bursts coalesce and at most one pass runs at a time.
+Each pass executes on a private event loop in a worker thread: export reconciliation re-reads and
+re-parses every exported thread YAML synchronously, which blocked the runtime loop for over five
+seconds per pass (``event_loop_stall_detected``) when run inline.
 The runner task must stay inside the module-global ``_runner_tasks`` dict: plugin hot reload only
 cancels tasks it finds in module globals or one level inside a global dict/list/set.
 """
@@ -13,10 +16,12 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import mindroom.thread_export as thread_export_pkg
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.hooks import (
     AfterResponseContext,
@@ -52,6 +57,13 @@ _pending_room_ids: set[str] = set()
 _full_pass_pending = False
 _wakeup: asyncio.Event | None = None
 _latest_env: _TriggerEnv | None = None
+
+# Hot reload replaces this module but cannot interrupt a worker thread mid-pass, so the
+# single-flight lock lives on the long-lived core package where every plugin copy finds it.
+_EXPORT_PASS_LOCK: threading.Lock = thread_export_pkg.__dict__.setdefault(
+    "_thread_export_plugin_pass_lock",
+    threading.Lock(),
+)
 
 
 @dataclass(frozen=True)
@@ -156,9 +168,19 @@ async def _run_export_loop() -> None:
             continue
         env = _latest_env or env
         try:
-            await _run_export_pass(env, full_pass=full_pass, room_ids=room_ids)
+            await asyncio.to_thread(
+                _run_export_pass_blocking, env, full_pass=full_pass, room_ids=room_ids
+            )
         except Exception:
             env.logger.exception("Thread export pass crashed")
+
+
+def _run_export_pass_blocking(
+    env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
+) -> None:
+    """Run one export pass to completion on a private event loop in the calling thread."""
+    with _EXPORT_PASS_LOCK:
+        asyncio.run(_run_export_pass(env, full_pass=full_pass, room_ids=room_ids))
 
 
 def _private_instance_state_roots(

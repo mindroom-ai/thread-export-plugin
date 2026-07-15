@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
+import threading
 from importlib import util
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,10 +114,26 @@ def _lifecycle_ctx(tmp_path: Path, settings: dict[str, object]) -> SimpleNamespa
     return SimpleNamespace(**_base_ctx(tmp_path, settings))
 
 
-async def _drain(module: ModuleType, cycles: int = 50) -> None:
-    """Give the runner task enough loop iterations to finish pending passes."""
+async def _drain(module: ModuleType, cycles: int = 400) -> None:
+    """Wait until the runner and its worker thread finished all pending passes.
+
+    Passes run on a worker thread, so this polls real time and requires the idle
+    condition to hold across consecutive polls to bridge the dispatch gap between
+    draining the pending set and the thread acquiring the pass lock.
+    """
+    idle_streak = 0
     for _ in range(cycles):
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.005)
+        wakeup = module._wakeup
+        idle = (
+            not module._full_pass_pending
+            and not module._pending_room_ids
+            and not module._EXPORT_PASS_LOCK.locked()
+            and (wakeup is None or not wakeup.is_set())
+        )
+        idle_streak = idle_streak + 1 if idle else 0
+        if idle_streak >= 3:
+            return
 
 
 async def _shutdown_runner(module: ModuleType) -> None:
@@ -301,21 +318,26 @@ async def test_full_pass_subsumes_pending_rooms(tmp_path: Path) -> None:
 async def test_mid_pass_triggers_drain_in_one_followup(tmp_path: Path) -> None:
     """Triggers arriving during a pass should coalesce into exactly one follow-up pass."""
     module = _load_hooks_module()
-    release = asyncio.Event()
-    started = asyncio.Event()
+    release = threading.Event()
+    started = threading.Event()
 
     async def _blocking_export(
         *, targets: tuple[object, ...], **_kwargs: object
     ) -> tuple[Mock, ...]:
         started.set()
-        await release.wait()
+        while not release.is_set():
+            await asyncio.sleep(0.005)
         return _target_stats(targets=targets)
 
     module.export_threads_to_targets_once = AsyncMock(side_effect=_blocking_export)
     settings = _settings()
 
     await module.queue_room_on_message(_message_ctx(tmp_path, "!alpha:hs", settings))
-    await asyncio.wait_for(started.wait(), timeout=1)
+    for _ in range(200):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.005)
+    assert started.is_set()
 
     await module.queue_room_on_message(_message_ctx(tmp_path, "!beta:hs", settings))
     await module.queue_room_on_message(_message_ctx(tmp_path, "!gamma:hs", settings))
