@@ -117,6 +117,31 @@ Notes:
 - The active thread's file rewrites on every message, so a watching semantic index re-embeds that thread per message. This is negligible with a local embedder (Ollama, sentence-transformers) but costs real money with paid embedding APIs in busy rooms.
 - Add `exclude_patterns: ["*/index.json"]` to the knowledge base if you prefer to keep the room indexes out of the semantic index.
 
+## Install
+
+Vendor this plugin with the MindRoom CLI:
+
+```bash
+mindroom plugins install thread-export-plugin
+```
+
+Then reference it from `config.yaml`:
+
+```yaml
+plugins:
+  - path: plugins/thread-export-plugin
+```
+
+Update to the latest commit later with:
+
+```bash
+mindroom plugins update thread-export-plugin
+```
+
+The command pins the exact installed commit in `.mindroom-plugin.lock.json` and strictly validates the plugin before activating it.
+It requires a MindRoom release newer than v2026.7.175.
+For a manual checkout instead, see Setup below.
+
 ## Setup
 
 1. Copy this plugin to `~/.mindroom/plugins/thread-export` (or reference it by relative path).
