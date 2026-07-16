@@ -18,5 +18,5 @@ jobs:
       plugin_repository: ${{ github.repository }}
       plugin_ref: ${{ github.sha }}
       artifact_name: thread-export-plugin
-      mindroom_ref: main
+      mindroom_ref: 6868d8bf005036301b705950c7112f688d340dd8
       require_tests: true
