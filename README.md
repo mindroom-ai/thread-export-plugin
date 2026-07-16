@@ -139,7 +139,6 @@ mindroom plugins update thread-export-plugin
 ```
 
 The command pins the exact installed commit in `.mindroom-plugin.lock.json` and strictly validates the plugin before activating it.
-It requires a MindRoom release newer than v2026.7.175.
 For a manual checkout instead, see Setup below.
 
 ## Setup
