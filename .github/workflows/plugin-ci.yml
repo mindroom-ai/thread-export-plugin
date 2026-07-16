@@ -1,0 +1,22 @@
+name: Plugin compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    permissions:
+      contents: read
+    uses: mindroom-ai/mindroom/.github/workflows/plugin-ci.yml@6868d8bf005036301b705950c7112f688d340dd8
+    with:
+      plugin_repository: ${{ github.repository }}
+      plugin_ref: ${{ github.sha }}
+      artifact_name: thread-export-plugin
+      mindroom_ref: main
+      require_tests: true
