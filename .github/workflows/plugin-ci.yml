@@ -17,7 +17,7 @@ jobs:
   compatibility:
     permissions:
       contents: read
-    uses: mindroom-ai/mindroom/.github/workflows/plugin-ci.yml@3a342bef5b1f2dd4b054d80fa5e747df15a675c3
+    uses: mindroom-ai/mindroom/.github/workflows/plugin-ci.yml@3a342bef51401b5fae1dee9a1b21066ea52c3916
     with:
       plugin_repository: ${{ github.repository }}
       plugin_ref: ${{ github.sha }}
