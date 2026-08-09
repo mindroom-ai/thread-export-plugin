@@ -15,7 +15,7 @@ When enabled for an agent, threads from every Matrix room that agent is currentl
 - Exports threads from every room the enabled agent is currently joined to into `<workspace>/thread_exports/<room>/<thread>.yaml` (the same layout as `mindroom threads export`)
 - Optionally covers user-created rooms too, while still requiring the enabled agent to be currently joined
 - Re-exports a room shortly after every message in it, plus one full pass at startup and after config hot reload
-- Cache-first: thread bodies are served from MindRoom's durable event cache, so passes barely touch the homeserver
+- Projection-first: thread bodies are served from MindRoom's durable event-journal visible-message projection, hydrating unread threads from the homeserver only when needed
 - Skip-unchanged writes: files are only rewritten when thread content actually changed
 - Reconciles removed threads and revoked room access so stale exports do not survive
 - Fetches each source thread once and fans it out to every authorized workspace
@@ -158,6 +158,6 @@ For a manual checkout instead, see Setup below.
 
 ## Notes
 
-- Cost profile: each pass performs one thread-list call per dirty room against the homeserver regardless of how many workspace targets receive it; thread bodies come from the local event cache.
+- Cost profile: thread bodies normally come from the local event-journal projection; threads not yet projected may be hydrated once from the homeserver, regardless of how many workspace targets receive them.
 - Every shared and private export target is membership-scoped. The `invited_rooms` option only controls whether user-created invited rooms are considered; it never bypasses the membership check.
 - Agents may edit or delete their exported YAML files; deleted files are restored on the next pass that touches the room and on the next startup pass.

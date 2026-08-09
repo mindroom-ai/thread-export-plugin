@@ -2,8 +2,8 @@
 """Automatically export Matrix threads to YAML in enabled agents' workspaces.
 
 Message hooks only record which room changed; one module-global runner task debounces triggers and
-runs cache-first export passes (``export_threads_once(prefer_cache=True)``) into every enabled
-agent's workspace, so bursts coalesce and at most one pass runs at a time.
+runs journal-backed export passes into every enabled agent's workspace, so bursts coalesce and at
+most one pass runs at a time.
 Each pass executes on a private event loop in a worker thread: export reconciliation re-reads and
 re-parses every exported thread YAML synchronously, which blocked the runtime loop for over five
 seconds per pass (``event_loop_stall_detected``) when run inline.
@@ -381,7 +381,6 @@ async def _run_export_pass(
                 runtime_paths=env.runtime_paths,
                 targets=targets,
                 room_filter=room_filter,
-                prefer_cache=True,
             )
         except Exception as exc:
             env.logger.warning(
