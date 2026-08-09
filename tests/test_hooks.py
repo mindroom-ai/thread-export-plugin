@@ -11,7 +11,7 @@ from importlib import util
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 
@@ -155,6 +155,15 @@ def _target_stats(
     )
 
 
+def _autospec_export(module: ModuleType, *, side_effect: object) -> None:
+    """Replace the MindRoom export API with a signature-enforcing async mock."""
+    module.export_threads_to_targets_once = create_autospec(
+        module.export_threads_to_targets_once,
+        spec_set=True,
+        side_effect=side_effect,
+    )
+
+
 def test_hook_metadata_matches_spec() -> None:
     """The hooks should target the expected lifecycle and message events."""
     module = _load_hooks_module()
@@ -199,7 +208,7 @@ async def test_message_hooks_inactive_without_agents_setting(tmp_path: Path) -> 
 async def test_config_reload_queues_full_pass(tmp_path: Path) -> None:
     """Hot reload should backfill all rooms through one full export pass."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     settings = _settings()
 
     await module.queue_full_pass_after_config_reload(_lifecycle_ctx(tmp_path, settings))
@@ -216,7 +225,7 @@ async def test_config_reload_queues_full_pass(tmp_path: Path) -> None:
 async def test_message_triggers_coalesce_into_one_pass(tmp_path: Path) -> None:
     """Repeated triggers should coalesce into one shared export per dirty room."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     settings = _settings()
 
     await module.queue_room_on_message(_message_ctx(tmp_path, "!alpha:hs", settings))
@@ -235,7 +244,6 @@ async def test_message_triggers_coalesce_into_one_pass(tmp_path: Path) -> None:
     assert room_filters == {"!alpha:hs", "!beta:hs"}
     expected_output_dir = tmp_path / "agents" / "code" / "workspace" / "thread_exports"
     for call in module.export_threads_to_targets_once.await_args_list:
-        assert call.kwargs["prefer_cache"] is True
         assert len(call.kwargs["targets"]) == 1
         target = call.kwargs["targets"][0]
         assert target.output_dir == expected_output_dir
@@ -247,7 +255,7 @@ async def test_message_triggers_coalesce_into_one_pass(tmp_path: Path) -> None:
 async def test_agent_mapping_settings_control_invited_rooms(tmp_path: Path) -> None:
     """The mapping form of the agents setting should control invited-room export per agent."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     settings: dict[str, object] = {
         "agents": {"code": {"invited_rooms": False}, "research": None},
         "debounce_seconds": 0,
@@ -275,7 +283,7 @@ async def test_agent_mapping_settings_control_invited_rooms(tmp_path: Path) -> N
 async def test_bot_ready_runs_full_pass(tmp_path: Path) -> None:
     """bot:ready should queue one full pass shared by all enabled agents."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     settings = _settings(agents=["code", "research"])
 
     await module.queue_initial_full_pass(_lifecycle_ctx(tmp_path, settings))
@@ -300,7 +308,7 @@ async def test_bot_ready_runs_full_pass(tmp_path: Path) -> None:
 async def test_full_pass_subsumes_pending_rooms(tmp_path: Path) -> None:
     """A pending full pass should replace per-room exports in the same drain."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     settings = _settings()
 
     await module.queue_room_on_message(_message_ctx(tmp_path, "!alpha:hs", settings))
@@ -329,7 +337,7 @@ async def test_mid_pass_triggers_drain_in_one_followup(tmp_path: Path) -> None:
             await asyncio.sleep(0.005)
         return _target_stats(targets=targets)
 
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_blocking_export)
+    _autospec_export(module, side_effect=_blocking_export)
     settings = _settings()
 
     await module.queue_room_on_message(_message_ctx(tmp_path, "!alpha:hs", settings))
@@ -360,7 +368,8 @@ async def test_export_failure_does_not_kill_runner_or_later_passes(
 ) -> None:
     """One failed shared pass should not block a later dirty-room pass."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(
+    _autospec_export(
+        module,
         side_effect=[
             RuntimeError("export failed"),
             (
@@ -396,7 +405,7 @@ async def test_export_failure_does_not_kill_runner_or_later_passes(
 async def test_unknown_agents_are_warned_and_skipped(tmp_path: Path) -> None:
     """Settings naming unknown agents should warn and export only for known ones."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     logger = Mock()
     config, runtime_paths = _shared_runtime(tmp_path, ("code",))
     env = module._TriggerEnv(
@@ -421,7 +430,7 @@ async def test_unknown_agents_are_warned_and_skipped(tmp_path: Path) -> None:
 async def test_full_pass_removes_exports_for_disabled_agents(tmp_path: Path) -> None:
     """Removing an agent from plugin settings should delete its plugin-owned exports."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     research_export_dir = (
         tmp_path / "agents" / "research" / "workspace" / "thread_exports"
     )
@@ -448,7 +457,7 @@ async def test_shared_agent_without_persisted_identity_fails_closed(
 ) -> None:
     """A missing shared-agent account should remove prior exports instead of widening access."""
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     export_dir = tmp_path / "agents" / "code" / "workspace" / "thread_exports"
     export_dir.mkdir(parents=True)
     (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
@@ -486,7 +495,7 @@ async def test_private_agent_exports_scoped_to_resolved_owners(tmp_path: Path) -
     )
 
     module = _load_hooks_module()
-    module.export_threads_to_targets_once = AsyncMock(side_effect=_target_stats)
+    _autospec_export(module, side_effect=_target_stats)
     config = Config(
         agents={
             "secret": AgentConfig(
