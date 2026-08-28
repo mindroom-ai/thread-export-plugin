@@ -16,7 +16,12 @@ from unittest.mock import Mock, create_autospec
 import pytest
 
 from mindroom.config.access import ResponderAccessConfig, RoomDefaultsConfig
-from mindroom.config.agent import AgentConfig, AgentPrivateConfig, RoomConfig
+from mindroom.config.agent import (
+    AgentConfig,
+    AgentPrivateConfig,
+    RoomConfig,
+    TeamConfig,
+)
 from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import RouterConfig
@@ -503,6 +508,14 @@ def test_private_instance_owner_candidates_use_membership_access_schema() -> Non
                 access=ResponderAccessConfig(users=["@agent-user:hs", "@admin:hs"]),
             ),
         },
+        teams={
+            "reviewers": TeamConfig(
+                display_name="Reviewers",
+                role="Review exports",
+                agents=["secret"],
+                access=ResponderAccessConfig(users=["@team-user:hs"]),
+            ),
+        },
         router=RouterConfig(access=ResponderAccessConfig(users=["@router-user:hs"])),
         authorization=AuthorizationConfig(aliases={"@canonical:hs": ["@bridge:hs"]}),
     )
@@ -512,6 +525,7 @@ def test_private_instance_owner_candidates_use_membership_access_schema() -> Non
         "@default-member:hs",
         "@project-member:hs",
         "@agent-user:hs",
+        "@team-user:hs",
         "@router-user:hs",
         "@canonical:hs",
     )

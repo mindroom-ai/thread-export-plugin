@@ -273,7 +273,7 @@ def _agent_export_targets(
     """Return export targets for one agent: shared workspace, or one owner-scoped target per instance.
 
     Private instances export only rooms their owner is a member of; instances whose owner cannot be
-    resolved from the authorization config are skipped entirely (fail closed).
+    resolved from statically configured membership-access identities are skipped entirely.
     """
     agent_config = env.config.agents.get(agent_name)
     if agent_config is None:
