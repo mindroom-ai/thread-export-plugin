@@ -78,7 +78,7 @@ Instances are discovered on disk, so a brand-new requester's instance starts rec
 
 Shared-agent exports are scoped to the enabled agent's current room memberships.
 Private-instance exports are scoped to the owner's current memberships, so one requester's private workspace never accumulates other users' conversations.
-Instance owners are resolved by matching instance directories against the Matrix user IDs in the `authorization` config; instances whose owner cannot be resolved have their prior exports removed and are skipped with a warning in the logs.
+Instance owners are resolved by matching instance directories against statically configured Matrix user IDs from `administrators`, room invitation policies, responder `access.users`, and canonical alias entries; instances whose owner cannot be resolved have their prior exports removed and are skipped with a warning in the logs.
 Membership lookups that fail also fail closed: prior exports for that room are removed and the lookup is reported as a failure.
 
 ## Semantic Search Over Exports

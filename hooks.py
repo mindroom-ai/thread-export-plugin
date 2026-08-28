@@ -201,15 +201,21 @@ def _private_instance_state_roots(
 
 
 def _authorized_requester_candidates(config: Config) -> tuple[str, ...]:
-    """Return authorized Matrix user IDs that may own private agent instances."""
+    """Return statically configured Matrix IDs that may own private instances."""
     authorization = config.authorization
     raw = [
-        *authorization.global_users,
-        *(user for users in authorization.room_permissions.values() for user in users),
+        *config.administrators,
+        *config.room_defaults.invite_users,
+        *(user for room in config.rooms.values() for user in (room.invite_users or ())),
         *(
             user
-            for users in authorization.agent_reply_permissions.values()
-            for user in users
+            for entity in (
+                *config.agents.values(),
+                *config.teams.values(),
+                config.router,
+            )
+            if entity.access is not None
+            for user in entity.access.users
         ),
         *authorization.aliases,
     ]

@@ -15,12 +15,18 @@ from unittest.mock import Mock, create_autospec
 
 import pytest
 
-from mindroom.config.agent import AgentConfig
+from mindroom.config.access import ResponderAccessConfig, RoomDefaultsConfig
+from mindroom.config.agent import AgentConfig, AgentPrivateConfig, RoomConfig
+from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
+from mindroom.config.models import RouterConfig
 from mindroom.constants import RuntimePaths
 from mindroom.hooks.decorators import get_hook_metadata
 from mindroom.matrix.identity import managed_account_key
 from mindroom.matrix.state import MatrixState
+from mindroom.tool_system.worker_routing import (
+    private_instance_state_root_for_requester,
+)
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -484,16 +490,36 @@ async def test_shared_agent_without_persisted_identity_fails_closed(
     )
 
 
+def test_private_instance_owner_candidates_use_membership_access_schema() -> None:
+    """Private-owner discovery should use every statically authored requester source."""
+    module = _load_hooks_module()
+    config = Config(
+        administrators=["@admin:hs"],
+        room_defaults=RoomDefaultsConfig(invite_users=["@default-member:hs"]),
+        rooms={"project": RoomConfig(invite_users=["@project-member:hs"])},
+        agents={
+            "secret": AgentConfig(
+                display_name="Secret",
+                access=ResponderAccessConfig(users=["@agent-user:hs", "@admin:hs"]),
+            ),
+        },
+        router=RouterConfig(access=ResponderAccessConfig(users=["@router-user:hs"])),
+        authorization=AuthorizationConfig(aliases={"@canonical:hs": ["@bridge:hs"]}),
+    )
+
+    assert module._authorized_requester_candidates(config) == (
+        "@admin:hs",
+        "@default-member:hs",
+        "@project-member:hs",
+        "@agent-user:hs",
+        "@router-user:hs",
+        "@canonical:hs",
+    )
+
+
 @pytest.mark.asyncio
 async def test_private_agent_exports_scoped_to_resolved_owners(tmp_path: Path) -> None:
     """Private instances should export only for resolvable owners, scoped to the owner's rooms."""
-    from mindroom.config.agent import AgentConfig, AgentPrivateConfig
-    from mindroom.config.auth import AuthorizationConfig
-    from mindroom.config.main import Config
-    from mindroom.tool_system.worker_routing import (
-        private_instance_state_root_for_requester,
-    )
-
     module = _load_hooks_module()
     _autospec_export(module, side_effect=_target_stats)
     config = Config(
@@ -502,7 +528,7 @@ async def test_private_agent_exports_scoped_to_resolved_owners(tmp_path: Path) -
                 display_name="Secret", private=AgentPrivateConfig(per="user")
             )
         },
-        authorization=AuthorizationConfig(global_users=["@alice:hs", "@bob:hs"]),
+        administrators=["@alice:hs", "@bob:hs"],
     )
     runtime_paths = SimpleNamespace(
         storage_root=tmp_path, env_value=lambda _name, default=None: default
