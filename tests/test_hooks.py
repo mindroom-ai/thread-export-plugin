@@ -117,7 +117,11 @@ def _after_response_ctx(
     tmp_path: Path, room_id: str, settings: dict[str, object]
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        result=SimpleNamespace(envelope=SimpleNamespace(room_id=room_id)),
+        result=SimpleNamespace(
+            envelope=SimpleNamespace(
+                room_id=room_id, requester_id="@requester:hs"
+            )
+        ),
         **_base_ctx(tmp_path, settings),
     )
 
@@ -635,4 +639,104 @@ async def test_message_requester_resolves_unlisted_private_owner(tmp_path: Path)
     )
     assert targets[0].output_dir == (
         instance_root / "secret_data" / "thread_exports"
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_requester_without_private_instance_is_not_retained(
+    tmp_path: Path,
+) -> None:
+    """Owner discovery state should not retain users without a private instance."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config = Config(
+        agents={
+            "secret": AgentConfig(
+                display_name="Secret",
+                access=ResponderAccessConfig(current_room_members=True),
+                private=AgentPrivateConfig(per="user_agent"),
+            )
+        },
+    )
+    runtime_paths = SimpleNamespace(
+        storage_root=tmp_path, env_value=lambda _name, default=None: default
+    )
+    ctx = SimpleNamespace(
+        envelope=SimpleNamespace(
+            room_id="!public:hs", requester_id="@visitor:hs"
+        ),
+        settings={"agents": ["secret"], "debounce_seconds": 0},
+        config=config,
+        runtime_paths=runtime_paths,
+        logger=Mock(),
+    )
+
+    await module.queue_room_on_message(ctx)
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    assert module._observed_requester_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> None:
+    """The response hook should discover an instance created after message ingress."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config = Config(
+        agents={
+            "secret": AgentConfig(
+                display_name="Secret",
+                access=ResponderAccessConfig(current_room_members=True),
+                private=AgentPrivateConfig(per="user_agent"),
+            )
+        },
+    )
+    runtime_paths = SimpleNamespace(
+        storage_root=tmp_path, env_value=lambda _name, default=None: default
+    )
+    requester_id = "@new-owner:hs"
+    settings = {"agents": ["secret"], "debounce_seconds": 0}
+    message_ctx = SimpleNamespace(
+        envelope=SimpleNamespace(
+            room_id="!private:hs", requester_id=requester_id
+        ),
+        settings=settings,
+        config=config,
+        runtime_paths=runtime_paths,
+        logger=Mock(),
+    )
+
+    await module.queue_room_on_message(message_ctx)
+    await _drain(module)
+    module._observed_requester_ids.clear()
+
+    instance_root = private_instance_state_root_for_requester(
+        tmp_path,
+        requester_id=requester_id,
+        agent_name="secret",
+        worker_scope="user_agent",
+        runtime_paths=runtime_paths,
+    )
+    assert instance_root is not None
+    instance_root.mkdir(parents=True)
+    response_ctx = SimpleNamespace(
+        result=SimpleNamespace(
+            envelope=SimpleNamespace(
+                room_id="!private:hs", requester_id=requester_id
+            )
+        ),
+        settings=settings,
+        config=config,
+        runtime_paths=runtime_paths,
+        logger=Mock(),
+    )
+
+    await module.queue_room_after_response(response_ctx)
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.required_member_user_id for target in targets) == (
+        requester_id,
     )
