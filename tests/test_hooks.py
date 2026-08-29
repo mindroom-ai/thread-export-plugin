@@ -164,9 +164,7 @@ def _after_response_ctx(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         result=SimpleNamespace(
-            envelope=SimpleNamespace(
-                room_id=room_id, requester_id="@requester:hs"
-            )
+            envelope=SimpleNamespace(room_id=room_id, requester_id="@requester:hs")
         ),
         **_base_ctx(tmp_path, settings),
     )
@@ -588,6 +586,62 @@ async def test_private_agent_without_persisted_identity_fails_closed(
     )
 
 
+@pytest.mark.asyncio
+async def test_all_underscore_private_agent_uses_canonical_state_root(
+    tmp_path: Path,
+) -> None:
+    """A valid all-underscore agent should use its runtime-normalized state root."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    agent_name = "___"
+    requester_id = "@alice:hs"
+    config = Config(
+        agents={
+            agent_name: AgentConfig(
+                display_name="Underscore Agent",
+                private=AgentPrivateConfig(per="user"),
+            ),
+        },
+        administrators=[requester_id],
+    )
+    runtime_paths = RuntimePaths(
+        config_path=tmp_path / "config.yaml",
+        config_dir=tmp_path,
+        env_path=tmp_path / ".env",
+        storage_root=tmp_path,
+    )
+    state = MatrixState()
+    state.add_account(
+        managed_account_key(agent_name),
+        "mindroom_worker",
+        _TEST_PASSWORD,
+        domain="localhost",
+    )
+    state.save(runtime_paths)
+    instance_root = private_instance_state_root_for_requester(
+        tmp_path,
+        requester_id=requester_id,
+        agent_name=agent_name,
+        worker_scope="user",
+        runtime_paths=runtime_paths,
+    )
+    assert instance_root is not None
+    assert instance_root.name == "worker"
+    instance_root.mkdir(parents=True)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": [agent_name]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert len(targets) == 1
+    assert targets[0].output_dir == (instance_root / "____data" / "thread_exports")
+
+
 def test_private_instance_owner_candidates_use_membership_access_schema() -> None:
     """Private-owner discovery should use every statically authored requester source."""
     module = _load_hooks_module()
@@ -702,7 +756,9 @@ async def test_private_agent_owner_scope_requires_only_owner_membership(
 
 
 @pytest.mark.asyncio
-async def test_message_requester_resolves_unlisted_private_owner(tmp_path: Path) -> None:
+async def test_message_requester_resolves_unlisted_private_owner(
+    tmp_path: Path,
+) -> None:
     """A current-room requester should resolve their private instance without static config."""
     module = _load_hooks_module()
     _autospec_export(module, side_effect=_target_stats)
@@ -747,9 +803,7 @@ async def test_message_requester_resolves_unlisted_private_owner(tmp_path: Path)
     assert tuple(target.required_member_user_ids for target in targets) == (
         (requester_id,),
     )
-    assert targets[0].output_dir == (
-        instance_root / "secret_data" / "thread_exports"
-    )
+    assert targets[0].output_dir == (instance_root / "secret_data" / "thread_exports")
 
 
 @pytest.mark.asyncio
@@ -772,9 +826,7 @@ async def test_message_requester_without_private_instance_is_not_retained(
         storage_root=tmp_path, env_value=lambda _name, default=None: default
     )
     ctx = SimpleNamespace(
-        envelope=SimpleNamespace(
-            room_id="!public:hs", requester_id="@visitor:hs"
-        ),
+        envelope=SimpleNamespace(room_id="!public:hs", requester_id="@visitor:hs"),
         settings={"agents": ["secret"], "debounce_seconds": 0},
         config=config,
         runtime_paths=runtime_paths,
@@ -811,9 +863,7 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
         "debounce_seconds": 0,
     }
     message_ctx = SimpleNamespace(
-        envelope=SimpleNamespace(
-            room_id="!private:hs", requester_id=requester_id
-        ),
+        envelope=SimpleNamespace(room_id="!private:hs", requester_id=requester_id),
         settings=settings,
         config=config,
         runtime_paths=runtime_paths,
@@ -835,9 +885,7 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
     instance_root.mkdir(parents=True)
     response_ctx = SimpleNamespace(
         result=SimpleNamespace(
-            envelope=SimpleNamespace(
-                room_id="!private:hs", requester_id=requester_id
-            )
+            envelope=SimpleNamespace(room_id="!private:hs", requester_id=requester_id)
         ),
         settings=settings,
         config=config,

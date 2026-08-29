@@ -33,6 +33,7 @@ from mindroom.hooks import (
 from mindroom.matrix.identity import managed_account_key, managed_account_user_id
 from mindroom.thread_export import ThreadExportTarget, export_threads_to_targets_once
 from mindroom.tool_system.worker_routing import (
+    agent_state_root_path,
     agent_workspace_root_path,
     private_instance_state_root_for_requester,
 )
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.hooks.context import HookContext
+    from mindroom.tool_system.worker_routing import WorkerScope
 
 WORKSPACE_EXPORT_DIRNAME = "thread_exports"
 PRIVATE_INSTANCES_DIRNAME = "private_instances"
@@ -248,7 +250,7 @@ def _private_instance_state_roots(
     instances_root = storage_root / PRIVATE_INSTANCES_DIRNAME
     if not instances_root.is_dir():
         return ()
-    instance_dir_name = agent_name.strip("_") or agent_name
+    instance_dir_name = agent_state_root_path(storage_root, agent_name).name
     return tuple(
         sorted(
             scope_dir / instance_dir_name
@@ -283,7 +285,7 @@ def _authorized_requester_candidates(config: Config) -> tuple[str, ...]:
 
 
 def _private_instance_owners(
-    env: _TriggerEnv, agent_name: str, worker_scope: str
+    env: _TriggerEnv, agent_name: str, worker_scope: WorkerScope
 ) -> dict[Path, str]:
     """Map private-instance roots to statically configured or observed requesters."""
     owners: dict[Path, str] = {}
@@ -325,52 +327,47 @@ def _private_workspace_export_dir(
     return workspace.root / WORKSPACE_EXPORT_DIRNAME if workspace is not None else None
 
 
-def _agent_export_targets(
+def _shared_agent_export_targets(
     env: _TriggerEnv,
     agent_name: str,
     *,
-    include_invited_rooms: bool,
-    private_room_scope: PrivateRoomScope,
+    agent_user_id: str | None,
+    options: _AgentExportSettings,
 ) -> tuple[ThreadExportTarget, ...]:
-    """Return export targets for one agent: shared workspace, or one private target per owner.
-
-    Private targets require the owner, and by default the managed agent, to be room members.
-    Instances whose owner cannot be resolved are skipped entirely.
-    """
-    agent_config = env.config.agents.get(agent_name)
-    if agent_config is None:
-        return ()
-    agent_user_id = managed_account_user_id(
-        managed_account_key(agent_name),
-        env.config.get_domain(env.runtime_paths),
-        env.runtime_paths,
+    """Return the membership-scoped target for one shared agent."""
+    workspace_dir = agent_workspace_root_path(
+        env.runtime_paths.storage_root, agent_name
     )
-    if agent_config.private is None:
-        workspace_dir = agent_workspace_root_path(
-            env.runtime_paths.storage_root, agent_name
+    output_dir = workspace_dir / WORKSPACE_EXPORT_DIRNAME
+    if agent_user_id is None:
+        _remove_export_tree(output_dir)
+        env.logger.warning(
+            "Skipping shared agent without persisted Matrix account",
+            agent_name=agent_name,
         )
-        output_dir = workspace_dir / WORKSPACE_EXPORT_DIRNAME
-        if agent_user_id is None:
-            _remove_export_tree(output_dir)
-            env.logger.warning(
-                "Skipping shared agent without persisted Matrix account",
-                agent_name=agent_name,
-            )
-            return ()
-        return (
-            ThreadExportTarget(
-                output_dir=output_dir,
-                required_member_user_ids=(agent_user_id,),
-                include_invited_rooms=include_invited_rooms,
-            ),
-        )
+        return ()
+    return (
+        ThreadExportTarget(
+            output_dir=output_dir,
+            required_member_user_ids=(agent_user_id,),
+            include_invited_rooms=options.invited_rooms,
+        ),
+    )
+
+
+def _private_agent_export_targets(
+    env: _TriggerEnv,
+    agent_name: str,
+    *,
+    agent_user_id: str | None,
+    options: _AgentExportSettings,
+    worker_scope: WorkerScope,
+) -> tuple[ThreadExportTarget, ...]:
+    """Return one membership-scoped target per resolvable private instance."""
     state_roots = _private_instance_state_roots(
         env.runtime_paths.storage_root, agent_name
     )
-    if (
-        private_room_scope == "owner_and_agent"
-        and agent_user_id is None
-    ):
+    if options.private_room_scope == "owner_and_agent" and agent_user_id is None:
         for state_root in state_roots:
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
@@ -380,7 +377,7 @@ def _agent_export_targets(
             agent_name=agent_name,
         )
         return ()
-    owners = _private_instance_owners(env, agent_name, agent_config.private.per)
+    owners = _private_instance_owners(env, agent_name, worker_scope)
     targets: list[ThreadExportTarget] = []
     for state_root in state_roots:
         output_dir = _private_workspace_export_dir(env, agent_name, state_root)
@@ -396,17 +393,48 @@ def _agent_export_targets(
             )
             continue
         required_member_user_ids = (owner,)
-        if private_room_scope == "owner_and_agent":
+        if options.private_room_scope == "owner_and_agent":
             assert agent_user_id is not None
             required_member_user_ids += (agent_user_id,)
         targets.append(
             ThreadExportTarget(
                 output_dir=output_dir,
                 required_member_user_ids=required_member_user_ids,
-                include_invited_rooms=include_invited_rooms,
-            ),
+                include_invited_rooms=options.invited_rooms,
+            )
         )
     return tuple(targets)
+
+
+def _agent_export_targets(
+    env: _TriggerEnv,
+    agent_name: str,
+    *,
+    options: _AgentExportSettings,
+) -> tuple[ThreadExportTarget, ...]:
+    """Return shared or requester-private export targets for one configured agent."""
+    agent_config = env.config.agents.get(agent_name)
+    if agent_config is None:
+        return ()
+    agent_user_id = managed_account_user_id(
+        managed_account_key(agent_name),
+        env.config.get_domain(env.runtime_paths),
+        env.runtime_paths,
+    )
+    if agent_config.private is None:
+        return _shared_agent_export_targets(
+            env,
+            agent_name,
+            agent_user_id=agent_user_id,
+            options=options,
+        )
+    return _private_agent_export_targets(
+        env,
+        agent_name,
+        agent_user_id=agent_user_id,
+        options=options,
+        worker_scope=agent_config.private.per,
+    )
 
 
 def _cleanup_disabled_agent_exports(
@@ -456,8 +484,7 @@ async def _run_export_pass(
         for target in _agent_export_targets(
             env,
             agent_name,
-            include_invited_rooms=options.invited_rooms,
-            private_room_scope=options.private_room_scope,
+            options=options,
         )
     ]
     targets = tuple(target for _, target, _ in target_records)
