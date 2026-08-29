@@ -513,7 +513,7 @@ async def _run_export_pass(
         for (agent_name, _target, _options), stats in zip(
             target_records, target_stats, strict=True
         ):
-            if not any(
+            if not full_pass and not any(
                 (
                     stats.rooms_exported,
                     stats.threads_exported,

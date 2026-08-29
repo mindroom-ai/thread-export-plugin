@@ -380,6 +380,41 @@ async def test_incremental_pass_logs_only_targets_with_activity(tmp_path: Path) 
     assert logger.info.call_args.kwargs["agent_name"] == "research"
 
 
+@pytest.mark.asyncio
+async def test_full_pass_logs_targets_without_activity(tmp_path: Path) -> None:
+    """Full reconciliation should retain a completion log for every target."""
+    module = _load_hooks_module()
+
+    async def _no_activity_stats(**_kwargs: object) -> tuple[Mock]:
+        return (
+            Mock(
+                rooms_exported=0,
+                threads_exported=0,
+                threads_unchanged=0,
+                failures=0,
+            ),
+        )
+
+    _autospec_export(module, side_effect=_no_activity_stats)
+    logger = Mock()
+    config, runtime_paths = _shared_runtime(tmp_path)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["code"]},
+        logger=logger,
+    )
+
+    await module._run_export_pass(
+        env,
+        full_pass=True,
+        room_ids=frozenset(),
+    )
+
+    logger.info.assert_called_once()
+    assert logger.info.call_args.kwargs["agent_name"] == "code"
+
+
 def test_unknown_private_room_scope_defaults_to_intersection() -> None:
     """A misspelled private scope must not silently widen exported room access."""
     module = _load_hooks_module()
