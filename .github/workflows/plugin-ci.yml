@@ -17,10 +17,10 @@ jobs:
   compatibility:
     permissions:
       contents: read
-    uses: mindroom-ai/mindroom/.github/workflows/plugin-ci.yml@bas/thread-export-member-intersection
+    uses: mindroom-ai/mindroom/.github/workflows/plugin-ci.yml@f8b996b3bc8becbf51cd6410e2a11bf21adf8d21
     with:
       plugin_repository: ${{ github.repository }}
       plugin_ref: ${{ github.sha }}
       artifact_name: thread-export-plugin
-      mindroom_ref: bas/thread-export-member-intersection
+      mindroom_ref: f8b996b3bc8becbf51cd6410e2a11bf21adf8d21
       require_tests: true
