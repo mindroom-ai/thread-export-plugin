@@ -94,6 +94,52 @@ def _shared_runtime(
     return config, runtime_paths
 
 
+def _private_runtime(
+    tmp_path: Path,
+    requester_ids: tuple[str, ...],
+    *,
+    persist_agent_identity: bool,
+) -> tuple[Config, RuntimePaths, dict[str, Path]]:
+    """Build one private-agent runtime and its requester-scoped instance roots."""
+    config = Config(
+        agents={
+            "secret": AgentConfig(
+                display_name="Secret",
+                private=AgentPrivateConfig(per="user"),
+            ),
+        },
+        administrators=list(requester_ids),
+    )
+    runtime_paths = RuntimePaths(
+        config_path=tmp_path / "config.yaml",
+        config_dir=tmp_path,
+        env_path=tmp_path / ".env",
+        storage_root=tmp_path,
+    )
+    if persist_agent_identity:
+        state = MatrixState()
+        state.add_account(
+            managed_account_key("secret"),
+            "mindroom_secret",
+            _TEST_PASSWORD,
+            domain="localhost",
+        )
+        state.save(runtime_paths)
+    instance_roots: dict[str, Path] = {}
+    for requester_id in requester_ids:
+        instance_root = private_instance_state_root_for_requester(
+            tmp_path,
+            requester_id=requester_id,
+            agent_name="secret",
+            worker_scope="user",
+            runtime_paths=runtime_paths,
+        )
+        assert instance_root is not None
+        instance_root.mkdir(parents=True)
+        instance_roots[requester_id] = instance_root
+    return config, runtime_paths, instance_roots
+
+
 def _base_ctx(tmp_path: Path, settings: dict[str, object]) -> dict[str, object]:
     config, runtime_paths = _shared_runtime(tmp_path)
     return {
@@ -516,30 +562,12 @@ async def test_private_agent_without_persisted_identity_fails_closed(
     """Intersection scope must remove private exports when the agent identity is unknown."""
     module = _load_hooks_module()
     _autospec_export(module, side_effect=_target_stats)
-    config = Config(
-        agents={
-            "secret": AgentConfig(
-                display_name="Secret",
-                private=AgentPrivateConfig(per="user"),
-            ),
-        },
-        administrators=["@alice:hs"],
-    )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path,
-    )
-    instance_root = private_instance_state_root_for_requester(
+    config, runtime_paths, instance_roots = _private_runtime(
         tmp_path,
-        requester_id="@alice:hs",
-        agent_name="secret",
-        worker_scope="user",
-        runtime_paths=runtime_paths,
+        ("@alice:hs",),
+        persist_agent_identity=False,
     )
-    assert instance_root is not None
-    export_dir = instance_root / "secret_data" / "thread_exports"
+    export_dir = instance_roots["@alice:hs"] / "secret_data" / "thread_exports"
     export_dir.mkdir(parents=True)
     (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
     logger = Mock()
@@ -603,40 +631,15 @@ async def test_private_agent_exports_require_owner_and_agent_membership_by_defau
     """Private exports should default to rooms where both owner and agent are members."""
     module = _load_hooks_module()
     _autospec_export(module, side_effect=_target_stats)
-    config = Config(
-        agents={
-            "secret": AgentConfig(
-                display_name="Secret", private=AgentPrivateConfig(per="user")
-            )
-        },
-        administrators=["@alice:hs", "@bob:hs"],
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        ("@alice:hs", "@bob:hs"),
+        persist_agent_identity=True,
     )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path,
-    )
-    state = MatrixState()
-    state.add_account(
-        managed_account_key("secret"),
-        "mindroom_secret",
-        _TEST_PASSWORD,
-        domain="localhost",
-    )
-    state.save(runtime_paths)
-    expected_dirs = {}
-    for requester_id in ("@alice:hs", "@bob:hs"):
-        instance_root = private_instance_state_root_for_requester(
-            tmp_path,
-            requester_id=requester_id,
-            agent_name="secret",
-            worker_scope="user",
-            runtime_paths=runtime_paths,
-        )
-        assert instance_root is not None
-        instance_root.mkdir(parents=True)
-        expected_dirs[requester_id] = instance_root / "secret_data" / "thread_exports"
+    expected_dirs = {
+        owner: instance_root / "secret_data" / "thread_exports"
+        for owner, instance_root in instance_roots.items()
+    }
     ghost_root = tmp_path / "private_instances" / "ghost-0000000000000000" / "secret"
     ghost_export_dir = ghost_root / "secret_data" / "thread_exports"
     ghost_export_dir.mkdir(parents=True)
@@ -677,38 +680,11 @@ async def test_private_agent_owner_scope_requires_only_owner_membership(
     """The explicit owner scope should include every room visible to the owner."""
     module = _load_hooks_module()
     _autospec_export(module, side_effect=_target_stats)
-    config = Config(
-        agents={
-            "secret": AgentConfig(
-                display_name="Secret",
-                private=AgentPrivateConfig(per="user"),
-            ),
-        },
-        administrators=["@alice:hs"],
-    )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path,
-    )
-    state = MatrixState()
-    state.add_account(
-        managed_account_key("secret"),
-        "mindroom_secret",
-        _TEST_PASSWORD,
-        domain="localhost",
-    )
-    state.save(runtime_paths)
-    instance_root = private_instance_state_root_for_requester(
+    config, runtime_paths, _instance_roots = _private_runtime(
         tmp_path,
-        requester_id="@alice:hs",
-        agent_name="secret",
-        worker_scope="user",
-        runtime_paths=runtime_paths,
+        ("@alice:hs",),
+        persist_agent_identity=True,
     )
-    assert instance_root is not None
-    instance_root.mkdir(parents=True)
     env = module._TriggerEnv(
         config=config,
         runtime_paths=runtime_paths,
