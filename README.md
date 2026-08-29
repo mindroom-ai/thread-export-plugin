@@ -44,6 +44,7 @@ When enabled for an agent, threads from every Matrix room that agent is currentl
 |---------|---------|---------|
 | `agents` | (none) | Agents whose workspaces receive exports: a list of names, or a mapping of name to per-agent options. Missing or empty disables the plugin |
 | `agents.<name>.invited_rooms` | `true` | Whether this agent's exports also consider rooms joined through invites (user-created rooms); current membership is always required |
+| `agents.<name>.private_room_scope` | `owner_and_agent` | Private agents only: require either owner membership, or both owner and managed-agent membership |
 | `debounce_seconds` | `2` | Delay after the last trigger before an export pass runs |
 
 Per-agent options example:
@@ -55,7 +56,8 @@ plugins:
       agents:
         code:
           invited_rooms: false   # config rooms only
-        research: {}             # defaults: invited rooms included
+        research:
+          private_room_scope: owner  # all rooms visible to each private owner
 ```
 
 ## Output Layout
@@ -160,4 +162,5 @@ For a manual checkout instead, see Setup below.
 
 - Cost profile: thread bodies normally come from the local event-journal projection; threads not yet projected may be hydrated once from the homeserver, regardless of how many workspace targets receive them.
 - Every shared and private export target is membership-scoped. The `invited_rooms` option only controls whether user-created invited rooms are considered; it never bypasses the membership check.
+- Private targets default to `owner_and_agent`, so inviting the managed agent is the explicit opt-in for exporting a room. Set `private_room_scope: owner` to export every room where the private instance's owner is currently joined.
 - Agents may edit or delete their exported YAML files; deleted files are restored on the next pass that touches the room and on the next startup pass.
