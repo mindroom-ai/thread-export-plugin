@@ -362,11 +362,16 @@ def _private_agent_export_targets(
     agent_user_id: str | None,
     options: _AgentExportSettings,
     worker_scope: WorkerScope,
+    reconcile_instances: bool,
 ) -> tuple[ThreadExportTarget, ...]:
-    """Return one membership-scoped target per resolvable private instance."""
-    state_roots = _private_instance_state_roots(
-        env.runtime_paths.storage_root, agent_name
-    )
+    """Return membership-scoped private targets, discovering orphans when requested."""
+    owners = _private_instance_owners(env, agent_name, worker_scope)
+    if reconcile_instances:
+        state_roots = _private_instance_state_roots(
+            env.runtime_paths.storage_root, agent_name
+        )
+    else:
+        state_roots = tuple(sorted(root for root in owners if root.is_dir()))
     if options.private_room_scope == "owner_and_agent" and agent_user_id is None:
         for state_root in state_roots:
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
@@ -377,7 +382,6 @@ def _private_agent_export_targets(
             agent_name=agent_name,
         )
         return ()
-    owners = _private_instance_owners(env, agent_name, worker_scope)
     targets: list[ThreadExportTarget] = []
     for state_root in state_roots:
         output_dir = _private_workspace_export_dir(env, agent_name, state_root)
@@ -411,6 +415,7 @@ def _agent_export_targets(
     agent_name: str,
     *,
     options: _AgentExportSettings,
+    reconcile_private_instances: bool,
 ) -> tuple[ThreadExportTarget, ...]:
     """Return shared or requester-private export targets for one configured agent."""
     agent_config = env.config.agents.get(agent_name)
@@ -434,6 +439,7 @@ def _agent_export_targets(
         agent_user_id=agent_user_id,
         options=options,
         worker_scope=agent_config.private.per,
+        reconcile_instances=reconcile_private_instances,
     )
 
 
@@ -485,6 +491,7 @@ async def _run_export_pass(
             env,
             agent_name,
             options=options,
+            reconcile_private_instances=full_pass,
         )
     ]
     targets = tuple(target for _, target, _ in target_records)
@@ -506,6 +513,15 @@ async def _run_export_pass(
         for (agent_name, _target, _options), stats in zip(
             target_records, target_stats, strict=True
         ):
+            if not any(
+                (
+                    stats.rooms_exported,
+                    stats.threads_exported,
+                    stats.threads_unchanged,
+                    stats.failures,
+                )
+            ):
+                continue
             env.logger.info(
                 "Exported threads to agent workspace",
                 agent_name=agent_name,
