@@ -137,7 +137,7 @@ def _private_runtime(
             runtime_paths=runtime_paths,
         )
         assert instance_root is not None
-        instance_root.mkdir(parents=True)
+        instance_root.mkdir(parents=True, exist_ok=True)
         instance_roots[requester_id] = instance_root
     return config, runtime_paths, instance_roots
 
@@ -906,6 +906,105 @@ async def test_conflicting_owner_marker_is_rejected_across_passes(
 
 
 @pytest.mark.asyncio
+async def test_colliding_requester_observations_fail_closed(tmp_path: Path) -> None:
+    """A second requester for one cached root must not replace its durable owner."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    first_owner = "@alice/test:hs"
+    second_owner = "@alice_test:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (first_owner,),
+        persist_agent_identity=True,
+        configured_requesters=False,
+    )
+    instance_root = instance_roots[first_owner]
+    second_root = private_instance_state_root_for_requester(
+        tmp_path,
+        requester_id=second_owner,
+        agent_name="secret",
+        worker_scope="user",
+        runtime_paths=runtime_paths,
+    )
+    assert second_root == instance_root
+    base_ctx = {
+        "settings": {"agents": ["secret"]},
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "logger": Mock(),
+    }
+
+    module._remember_private_instance_requester(
+        SimpleNamespace(**base_ctx), first_owner
+    )
+    marker_path = instance_root / ".mindroom-thread-export-owner.json"
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["requester_id"] == (
+        first_owner
+    )
+    module._known_private_owners.clear()
+    module._observed_requester_ids.clear()
+    module._conflicting_owner_roots.clear()
+
+    module._remember_private_instance_requester(
+        SimpleNamespace(**base_ctx), second_owner
+    )
+
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["requester_id"] == (
+        first_owner
+    )
+    module._observed_requester_ids.add(first_owner)
+    export_dir = instance_root / "secret_data" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    env = module._TriggerEnv(
+        **base_ctx,
+        requester_candidates=tuple(module._observed_requester_ids),
+        conflicting_owner_roots=frozenset(module._conflicting_owner_roots),
+    )
+    await module._run_export_pass(
+        env,
+        full_pass=False,
+        room_ids=frozenset({"!changed:hs"}),
+    )
+
+    assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
+    assert not export_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_colliding_configured_owner_candidates_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """A full pass must not persist an arbitrary configured owner for one root."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    first_owner = "@alice/test:hs"
+    second_owner = "@alice_test:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (first_owner, second_owner),
+        persist_agent_identity=True,
+    )
+    assert instance_roots[first_owner] == instance_roots[second_owner]
+    instance_root = instance_roots[first_owner]
+    export_dir = instance_root / "secret_data" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
+    assert not (instance_root / ".mindroom-thread-export-owner.json").exists()
+    assert not export_dir.exists()
+
+
+@pytest.mark.asyncio
 async def test_owner_repair_during_full_pass_discards_stale_conflict(
     tmp_path: Path,
 ) -> None:
@@ -961,6 +1060,7 @@ async def test_owner_repair_during_full_pass_discards_stale_conflict(
         await asyncio.sleep(0.005)
     assert started.is_set()
 
+    marker_path.unlink()
     await module.queue_room_on_message(
         SimpleNamespace(
             envelope=SimpleNamespace(
@@ -976,6 +1076,88 @@ async def test_owner_repair_during_full_pass_discards_stale_conflict(
     await _drain(module)
     await _shutdown_runner(module)
 
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (configured_owner, "@mindroom_secret:localhost"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_repair_during_incremental_pass_queues_full_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Repairing a stale incremental pass must restore every exported room."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    configured_owner = "@alice/test:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (configured_owner,),
+        persist_agent_identity=True,
+    )
+    instance_root = instance_roots[configured_owner]
+    marker_path = instance_root / ".mindroom-thread-export-owner.json"
+    marker_path.write_text(
+        '{"format":"mindroom-thread-export-owner","version":1,'
+        '"requester_id":"@alice_test:hs"}\n',
+        encoding="utf-8",
+    )
+    settings = {"agents": ["secret"], "debounce_seconds": 0}
+    base_ctx = {
+        "settings": settings,
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "logger": Mock(),
+    }
+    await module.queue_initial_full_pass(SimpleNamespace(**base_ctx))
+    await _drain(module)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    async def _blocking_export(
+        *, targets: tuple[object, ...], **_kwargs: object
+    ) -> tuple[Mock, ...]:
+        if not started.is_set():
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+        return _target_stats(targets=targets)
+
+    module.export_threads_to_targets_once.reset_mock()
+    module.export_threads_to_targets_once.side_effect = _blocking_export
+    await module.queue_room_on_message(
+        SimpleNamespace(
+            envelope=SimpleNamespace(
+                room_id="!unrelated:hs", requester_id="@unrelated:hs"
+            ),
+            **base_ctx,
+        )
+    )
+    for _ in range(200):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.005)
+    assert started.is_set()
+
+    marker_path.unlink()
+    await module.queue_room_on_message(
+        SimpleNamespace(
+            envelope=SimpleNamespace(
+                room_id="!changed:hs", requester_id=configured_owner
+            ),
+            **base_ctx,
+        )
+    )
+    release.set()
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    room_filters = [
+        call.kwargs["room_filter"]
+        for call in module.export_threads_to_targets_once.await_args_list
+    ]
+    assert room_filters[-1] is None
     targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
     assert tuple(target.required_member_user_ids for target in targets) == (
         (configured_owner, "@mindroom_secret:localhost"),
