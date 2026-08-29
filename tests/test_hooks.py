@@ -263,7 +263,7 @@ async def test_message_triggers_coalesce_into_one_pass(tmp_path: Path) -> None:
         assert len(call.kwargs["targets"]) == 1
         target = call.kwargs["targets"][0]
         assert target.output_dir == expected_output_dir
-        assert target.required_member_user_id == "@mindroom_code:localhost"
+        assert target.required_member_user_ids == ("@mindroom_code:localhost",)
         assert target.include_invited_rooms is True
 
 
@@ -284,15 +284,24 @@ async def test_agent_mapping_settings_control_invited_rooms(tmp_path: Path) -> N
     module.export_threads_to_targets_once.assert_awaited_once()
     invited_by_agent = {
         target.output_dir.parts[-3]: (
-            target.required_member_user_id,
+            target.required_member_user_ids,
             target.include_invited_rooms,
         )
         for target in module.export_threads_to_targets_once.await_args.kwargs["targets"]
     }
     assert invited_by_agent == {
-        "code": ("@mindroom_code:localhost", False),
-        "research": ("@mindroom_research:localhost", True),
+        "code": (("@mindroom_code:localhost",), False),
+        "research": (("@mindroom_research:localhost",), True),
     }
+
+
+def test_unknown_private_room_scope_defaults_to_intersection() -> None:
+    """A misspelled private scope must not silently widen exported room access."""
+    module = _load_hooks_module()
+
+    options = module._agent_options({"private_room_scope": "unknown"})
+
+    assert options.private_room_scope == "owner_and_agent"
 
 
 @pytest.mark.asyncio
@@ -500,6 +509,57 @@ async def test_shared_agent_without_persisted_identity_fails_closed(
     )
 
 
+@pytest.mark.asyncio
+async def test_private_agent_without_persisted_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Intersection scope must remove private exports when the agent identity is unknown."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config = Config(
+        agents={
+            "secret": AgentConfig(
+                display_name="Secret",
+                private=AgentPrivateConfig(per="user"),
+            ),
+        },
+        administrators=["@alice:hs"],
+    )
+    runtime_paths = RuntimePaths(
+        config_path=tmp_path / "config.yaml",
+        config_dir=tmp_path,
+        env_path=tmp_path / ".env",
+        storage_root=tmp_path,
+    )
+    instance_root = private_instance_state_root_for_requester(
+        tmp_path,
+        requester_id="@alice:hs",
+        agent_name="secret",
+        worker_scope="user",
+        runtime_paths=runtime_paths,
+    )
+    assert instance_root is not None
+    export_dir = instance_root / "secret_data" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    logger = Mock()
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=logger,
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert not export_dir.exists()
+    assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
+    logger.warning.assert_called_once_with(
+        "Skipping private agent without persisted Matrix account",
+        agent_name="secret",
+    )
+
+
 def test_private_instance_owner_candidates_use_membership_access_schema() -> None:
     """Private-owner discovery should use every statically authored requester source."""
     module = _load_hooks_module()
@@ -537,8 +597,10 @@ def test_private_instance_owner_candidates_use_membership_access_schema() -> Non
 
 
 @pytest.mark.asyncio
-async def test_private_agent_exports_scoped_to_resolved_owners(tmp_path: Path) -> None:
-    """Private instances should export only for resolvable owners, scoped to the owner's rooms."""
+async def test_private_agent_exports_require_owner_and_agent_membership_by_default(
+    tmp_path: Path,
+) -> None:
+    """Private exports should default to rooms where both owner and agent are members."""
     module = _load_hooks_module()
     _autospec_export(module, side_effect=_target_stats)
     config = Config(
@@ -549,9 +611,20 @@ async def test_private_agent_exports_scoped_to_resolved_owners(tmp_path: Path) -
         },
         administrators=["@alice:hs", "@bob:hs"],
     )
-    runtime_paths = SimpleNamespace(
-        storage_root=tmp_path, env_value=lambda _name, default=None: default
+    runtime_paths = RuntimePaths(
+        config_path=tmp_path / "config.yaml",
+        config_dir=tmp_path,
+        env_path=tmp_path / ".env",
+        storage_root=tmp_path,
     )
+    state = MatrixState()
+    state.add_account(
+        managed_account_key("secret"),
+        "mindroom_secret",
+        _TEST_PASSWORD,
+        domain="localhost",
+    )
+    state.save(runtime_paths)
     expected_dirs = {}
     for requester_id in ("@alice:hs", "@bob:hs"):
         instance_root = private_instance_state_root_for_requester(
@@ -580,10 +653,13 @@ async def test_private_agent_exports_scoped_to_resolved_owners(tmp_path: Path) -
 
     module.export_threads_to_targets_once.assert_awaited_once()
     exported = {
-        target.required_member_user_id: target.output_dir
+        target.required_member_user_ids: target.output_dir
         for target in module.export_threads_to_targets_once.await_args.kwargs["targets"]
     }
-    assert exported == expected_dirs
+    assert exported == {
+        (owner, "@mindroom_secret:localhost"): output_dir
+        for owner, output_dir in expected_dirs.items()
+    }
     assert not ghost_export_dir.exists()
     orphan_warnings = [
         call
@@ -592,6 +668,61 @@ async def test_private_agent_exports_scoped_to_resolved_owners(tmp_path: Path) -
     ]
     assert len(orphan_warnings) == 1
     assert "ghost-0000000000000000" in orphan_warnings[0].kwargs["instance_root"]
+
+
+@pytest.mark.asyncio
+async def test_private_agent_owner_scope_requires_only_owner_membership(
+    tmp_path: Path,
+) -> None:
+    """The explicit owner scope should include every room visible to the owner."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config = Config(
+        agents={
+            "secret": AgentConfig(
+                display_name="Secret",
+                private=AgentPrivateConfig(per="user"),
+            ),
+        },
+        administrators=["@alice:hs"],
+    )
+    runtime_paths = RuntimePaths(
+        config_path=tmp_path / "config.yaml",
+        config_dir=tmp_path,
+        env_path=tmp_path / ".env",
+        storage_root=tmp_path,
+    )
+    state = MatrixState()
+    state.add_account(
+        managed_account_key("secret"),
+        "mindroom_secret",
+        _TEST_PASSWORD,
+        domain="localhost",
+    )
+    state.save(runtime_paths)
+    instance_root = private_instance_state_root_for_requester(
+        tmp_path,
+        requester_id="@alice:hs",
+        agent_name="secret",
+        worker_scope="user",
+        runtime_paths=runtime_paths,
+    )
+    assert instance_root is not None
+    instance_root.mkdir(parents=True)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={
+            "agents": {"secret": {"private_room_scope": "owner"}},
+        },
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert len(targets) == 1
+    assert targets[0].required_member_user_ids == ("@alice:hs",)
 
 
 @pytest.mark.asyncio
@@ -623,7 +754,10 @@ async def test_message_requester_resolves_unlisted_private_owner(tmp_path: Path)
     instance_root.mkdir(parents=True)
     ctx = SimpleNamespace(
         envelope=SimpleNamespace(room_id="!private:hs", requester_id=requester_id),
-        settings={"agents": ["secret"], "debounce_seconds": 0},
+        settings={
+            "agents": {"secret": {"private_room_scope": "owner"}},
+            "debounce_seconds": 0,
+        },
         config=config,
         runtime_paths=runtime_paths,
         logger=Mock(),
@@ -634,8 +768,8 @@ async def test_message_requester_resolves_unlisted_private_owner(tmp_path: Path)
     await _shutdown_runner(module)
 
     targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
-    assert tuple(target.required_member_user_id for target in targets) == (
-        requester_id,
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (requester_id,),
     )
     assert targets[0].output_dir == (
         instance_root / "secret_data" / "thread_exports"
@@ -696,7 +830,10 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
         storage_root=tmp_path, env_value=lambda _name, default=None: default
     )
     requester_id = "@new-owner:hs"
-    settings = {"agents": ["secret"], "debounce_seconds": 0}
+    settings = {
+        "agents": {"secret": {"private_room_scope": "owner"}},
+        "debounce_seconds": 0,
+    }
     message_ctx = SimpleNamespace(
         envelope=SimpleNamespace(
             room_id="!private:hs", requester_id=requester_id
@@ -737,6 +874,6 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
     await _shutdown_runner(module)
 
     targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
-    assert tuple(target.required_member_user_id for target in targets) == (
-        requester_id,
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (requester_id,),
     )

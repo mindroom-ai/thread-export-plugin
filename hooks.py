@@ -19,7 +19,7 @@ import shutil
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 import mindroom.thread_export as thread_export_pkg
 from mindroom.constants import ROUTER_AGENT_NAME
@@ -52,6 +52,9 @@ PRIVATE_INSTANCES_DIRNAME = "private_instances"
 DEFAULT_DEBOUNCE_SECONDS = 2.0
 _MATRIX_USER_ID_PATTERN = re.compile(r"@[^:\s]+:\S+")
 
+type PrivateRoomScope = Literal["owner", "owner_and_agent"]
+DEFAULT_PRIVATE_ROOM_SCOPE: PrivateRoomScope = "owner_and_agent"
+
 _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
 _observed_requester_ids: set[str] = set()
@@ -83,15 +86,25 @@ class _AgentExportSettings:
     """Per-agent export options from the plugin settings."""
 
     invited_rooms: bool = True
+    private_room_scope: PrivateRoomScope = DEFAULT_PRIVATE_ROOM_SCOPE
 
 
 def _agent_options(options: object) -> _AgentExportSettings:
     """Parse one agent's option mapping, tolerating missing or bare entries."""
     if not isinstance(options, Mapping):
         return _AgentExportSettings()
-    invited_rooms = options.get("invited_rooms", True)
+    typed_options = cast("Mapping[str, object]", options)
+    invited_rooms = typed_options.get("invited_rooms", True)
+    raw_private_room_scope = typed_options.get(
+        "private_room_scope", DEFAULT_PRIVATE_ROOM_SCOPE
+    )
+    if raw_private_room_scope == "owner":
+        private_room_scope: PrivateRoomScope = "owner"
+    else:
+        private_room_scope = DEFAULT_PRIVATE_ROOM_SCOPE
     return _AgentExportSettings(
-        invited_rooms=invited_rooms if isinstance(invited_rooms, bool) else True
+        invited_rooms=invited_rooms if isinstance(invited_rooms, bool) else True,
+        private_room_scope=private_room_scope,
     )
 
 
@@ -101,7 +114,7 @@ def _requested_agents(
     """Return per-agent export options for the agents listed in the plugin settings.
 
     ``agents`` accepts a plain list of names (all defaults) or a mapping of name to options
-    (currently ``invited_rooms``, default true).
+    (``invited_rooms`` and ``private_room_scope``).
     """
     raw = settings.get("agents")
     parsed: dict[str, _AgentExportSettings] = {}
@@ -317,25 +330,26 @@ def _agent_export_targets(
     agent_name: str,
     *,
     include_invited_rooms: bool,
+    private_room_scope: PrivateRoomScope,
 ) -> tuple[ThreadExportTarget, ...]:
-    """Return export targets for one agent: shared workspace, or one owner-scoped target per instance.
+    """Return export targets for one agent: shared workspace, or one private target per owner.
 
-    Private instances export only rooms their owner is a member of; instances whose owner cannot be
-    resolved from statically configured or observed requester identities are skipped entirely.
+    Private targets require the owner, and by default the managed agent, to be room members.
+    Instances whose owner cannot be resolved are skipped entirely.
     """
     agent_config = env.config.agents.get(agent_name)
     if agent_config is None:
         return ()
+    agent_user_id = managed_account_user_id(
+        managed_account_key(agent_name),
+        env.config.get_domain(env.runtime_paths),
+        env.runtime_paths,
+    )
     if agent_config.private is None:
         workspace_dir = agent_workspace_root_path(
             env.runtime_paths.storage_root, agent_name
         )
         output_dir = workspace_dir / WORKSPACE_EXPORT_DIRNAME
-        agent_user_id = managed_account_user_id(
-            managed_account_key(agent_name),
-            env.config.get_domain(env.runtime_paths),
-            env.runtime_paths,
-        )
         if agent_user_id is None:
             _remove_export_tree(output_dir)
             env.logger.warning(
@@ -346,15 +360,29 @@ def _agent_export_targets(
         return (
             ThreadExportTarget(
                 output_dir=output_dir,
-                required_member_user_id=agent_user_id,
+                required_member_user_ids=(agent_user_id,),
                 include_invited_rooms=include_invited_rooms,
             ),
         )
+    state_roots = _private_instance_state_roots(
+        env.runtime_paths.storage_root, agent_name
+    )
+    if (
+        private_room_scope == "owner_and_agent"
+        and agent_user_id is None
+    ):
+        for state_root in state_roots:
+            output_dir = _private_workspace_export_dir(env, agent_name, state_root)
+            if output_dir is not None:
+                _remove_export_tree(output_dir)
+        env.logger.warning(
+            "Skipping private agent without persisted Matrix account",
+            agent_name=agent_name,
+        )
+        return ()
     owners = _private_instance_owners(env, agent_name, agent_config.private.per)
     targets: list[ThreadExportTarget] = []
-    for state_root in _private_instance_state_roots(
-        env.runtime_paths.storage_root, agent_name
-    ):
+    for state_root in state_roots:
         output_dir = _private_workspace_export_dir(env, agent_name, state_root)
         if output_dir is None:
             continue
@@ -367,10 +395,14 @@ def _agent_export_targets(
                 instance_root=str(state_root),
             )
             continue
+        required_member_user_ids = (owner,)
+        if private_room_scope == "owner_and_agent":
+            assert agent_user_id is not None
+            required_member_user_ids += (agent_user_id,)
         targets.append(
             ThreadExportTarget(
                 output_dir=output_dir,
-                required_member_user_id=owner,
+                required_member_user_ids=required_member_user_ids,
                 include_invited_rooms=include_invited_rooms,
             ),
         )
@@ -425,6 +457,7 @@ async def _run_export_pass(
             env,
             agent_name,
             include_invited_rooms=options.invited_rooms,
+            private_room_scope=options.private_room_scope,
         )
     ]
     targets = tuple(target for _, target, _ in target_records)
