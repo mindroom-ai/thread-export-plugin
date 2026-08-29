@@ -54,6 +54,7 @@ _MATRIX_USER_ID_PATTERN = re.compile(r"@[^:\s]+:\S+")
 
 _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
+_observed_requester_ids: set[str] = set()
 _full_pass_pending = False
 _wakeup: asyncio.Event | None = None
 _latest_env: _TriggerEnv | None = None
@@ -74,6 +75,7 @@ class _TriggerEnv:
     runtime_paths: RuntimePaths
     settings: Mapping[str, object]
     logger: BoundLogger
+    requester_candidates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,7 @@ def _record_trigger(ctx: HookContext) -> None:
         runtime_paths=ctx.runtime_paths,
         settings=ctx.settings,
         logger=ctx.logger,
+        requester_candidates=tuple(_observed_requester_ids),
     )
     if _wakeup is None:
         _wakeup = asyncio.Event()
@@ -227,9 +230,12 @@ def _authorized_requester_candidates(config: Config) -> tuple[str, ...]:
 def _private_instance_owners(
     env: _TriggerEnv, agent_name: str, worker_scope: str
 ) -> dict[Path, str]:
-    """Map existing private-instance state roots to the authorized requester that owns them."""
+    """Map private-instance roots to statically configured or observed requesters."""
     owners: dict[Path, str] = {}
-    for requester_id in _authorized_requester_candidates(env.config):
+    requester_candidates = dict.fromkeys(
+        (*_authorized_requester_candidates(env.config), *env.requester_candidates)
+    )
+    for requester_id in requester_candidates:
         candidate_root = private_instance_state_root_for_requester(
             env.runtime_paths.storage_root,
             requester_id=requester_id,
@@ -430,6 +436,9 @@ async def queue_room_on_message(ctx: MessageReceivedContext) -> None:
     """Queue the message's room for re-export."""
     if not _requested_agents(ctx.settings):
         return
+    requester_id = ctx.envelope.requester_id
+    if _MATRIX_USER_ID_PATTERN.fullmatch(requester_id):
+        _observed_requester_ids.add(requester_id)
     _pending_room_ids.add(ctx.envelope.room_id)
     _record_trigger(ctx)
 
