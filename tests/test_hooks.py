@@ -1235,6 +1235,47 @@ async def test_owner_marker_write_failure_does_not_block_current_export(
     assert owner in module._observed_requester_ids
 
 
+def test_failed_first_marker_write_reserves_owner_against_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient write failure must not let a colliding requester claim the root."""
+    module = _load_hooks_module()
+    first_owner = "@alice/test:hs"
+    second_owner = "@alice_test:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (first_owner,),
+        persist_agent_identity=True,
+        configured_requesters=False,
+    )
+    instance_root = instance_roots[first_owner]
+    real_write = module.write_json_file_durable
+    attempts = 0
+
+    def flaky_write(*args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary storage failure")
+        real_write(*args, **kwargs)
+
+    monkeypatch.setattr(module, "write_json_file_durable", flaky_write)
+    ctx = SimpleNamespace(
+        settings={"agents": ["secret"]},
+        config=config,
+        runtime_paths=runtime_paths,
+        logger=Mock(),
+    )
+
+    module._remember_private_instance_requester(ctx, first_owner)
+    module._remember_private_instance_requester(ctx, second_owner)
+
+    assert not (instance_root / ".mindroom-thread-export-owner.json").exists()
+    assert instance_root.resolve() in module._conflicting_owner_roots
+    assert attempts == 1
+
+
 def test_owner_marker_write_retries_after_transient_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1270,6 +1311,57 @@ def test_owner_marker_write_retries_after_transient_failure(
     module._remember_private_instance_requester(ctx, owner)
 
     marker_path = instance_roots[owner] / ".mindroom-thread-export-owner.json"
+    assert marker_path.exists()
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_full_pass_marker_write_failure_retries_on_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed backfill must stay pending after the full pass publishes its owner."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    owner = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (owner,),
+        persist_agent_identity=True,
+    )
+    real_write = module.write_json_file_durable
+    attempts = 0
+
+    def flaky_write(*args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary storage failure")
+        real_write(*args, **kwargs)
+
+    monkeypatch.setattr(module, "write_json_file_durable", flaky_write)
+    settings = {"agents": ["secret"], "debounce_seconds": 0}
+    base_ctx = {
+        "settings": settings,
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "logger": Mock(),
+    }
+
+    await module.queue_initial_full_pass(SimpleNamespace(**base_ctx))
+    await _drain(module)
+    marker_path = instance_roots[owner] / ".mindroom-thread-export-owner.json"
+    assert not marker_path.exists()
+
+    await module.queue_room_on_message(
+        SimpleNamespace(
+            envelope=SimpleNamespace(room_id="!changed:hs", requester_id=owner),
+            **base_ctx,
+        )
+    )
+    await _drain(module)
+    await _shutdown_runner(module)
+
     assert marker_path.exists()
     assert attempts == 2
 
