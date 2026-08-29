@@ -1083,6 +1083,60 @@ async def test_owner_repair_during_full_pass_discards_stale_conflict(
 
 
 @pytest.mark.asyncio
+async def test_owner_repair_before_next_pass_queues_full_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Repairing cached conflict state must queue an authoritative full pass."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    configured_owner = "@alice/test:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (configured_owner,),
+        persist_agent_identity=True,
+    )
+    instance_root = instance_roots[configured_owner]
+    marker_path = instance_root / ".mindroom-thread-export-owner.json"
+    marker_path.write_text(
+        '{"format":"mindroom-thread-export-owner","version":1,'
+        '"requester_id":"@alice_test:hs"}\n',
+        encoding="utf-8",
+    )
+    settings = {"agents": ["secret"], "debounce_seconds": 0}
+    base_ctx = {
+        "settings": settings,
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "logger": Mock(),
+    }
+    await module.queue_initial_full_pass(SimpleNamespace(**base_ctx))
+    await _drain(module)
+
+    marker_path.unlink()
+    module.export_threads_to_targets_once.reset_mock()
+    await module.queue_room_on_message(
+        SimpleNamespace(
+            envelope=SimpleNamespace(
+                room_id="!changed:hs", requester_id=configured_owner
+            ),
+            **base_ctx,
+        )
+    )
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    room_filters = [
+        call.kwargs["room_filter"]
+        for call in module.export_threads_to_targets_once.await_args_list
+    ]
+    assert room_filters[-1] is None
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (configured_owner, "@mindroom_secret:localhost"),
+    )
+
+
+@pytest.mark.asyncio
 async def test_owner_repair_during_incremental_pass_queues_full_reconciliation(
     tmp_path: Path,
 ) -> None:

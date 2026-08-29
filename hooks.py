@@ -236,7 +236,7 @@ def _remember_private_instance_requester(
     requester_id: str,
 ) -> None:
     """Retain one requester only while they own an enabled private instance."""
-    global _owner_state_generation  # noqa: PLW0603
+    global _full_pass_pending, _owner_state_generation  # noqa: PLW0603
     instances = _enabled_private_instances(ctx, requester_id)
     if not instances:
         return
@@ -262,6 +262,8 @@ def _remember_private_instance_requester(
         if known_owner is None:
             _known_private_owners[resolved_root] = requester_id
             _owner_state_generation += 1
+        if resolved_root in _conflicting_owner_roots:
+            _full_pass_pending = True
         if (
             resolved_root not in _persisted_owner_roots
             and _persist_private_instance_owner(state_root, requester_id, ctx.logger)
