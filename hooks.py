@@ -14,6 +14,7 @@ cancels tasks it finds in module globals or one level inside a global dict/list/
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import shutil
 import threading
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import mindroom.thread_export as thread_export_pkg
 from mindroom.constants import ROUTER_AGENT_NAME
+from mindroom.durable_write import write_json_file_durable
 from mindroom.hooks import (
     AfterResponseContext,
     AgentLifecycleContext,
@@ -51,6 +53,9 @@ if TYPE_CHECKING:
 
 WORKSPACE_EXPORT_DIRNAME = "thread_exports"
 PRIVATE_INSTANCES_DIRNAME = "private_instances"
+PRIVATE_INSTANCE_OWNER_FILENAME = ".mindroom-thread-export-owner.json"
+PRIVATE_INSTANCE_OWNER_FORMAT = "mindroom-thread-export-owner"
+PRIVATE_INSTANCE_OWNER_VERSION = 1
 DEFAULT_DEBOUNCE_SECONDS = 2.0
 _MATRIX_USER_ID_PATTERN = re.compile(r"@[^:\s]+:\S+")
 
@@ -60,6 +65,7 @@ DEFAULT_PRIVATE_ROOM_SCOPE: PrivateRoomScope = "owner_and_agent"
 _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
 _observed_requester_ids: set[str] = set()
+_owner_marker_roots: set[Path] = set()
 _full_pass_pending = False
 _wakeup: asyncio.Event | None = None
 _latest_env: _TriggerEnv | None = None
@@ -139,13 +145,14 @@ def _debounce_seconds(settings: Mapping[str, object]) -> float:
     return DEFAULT_DEBOUNCE_SECONDS
 
 
-def _requester_has_enabled_private_instance(
+def _enabled_private_instance_roots(
     ctx: HookContext,
     requester_id: str,
-) -> bool:
-    """Return whether this requester owns an existing enabled private instance."""
+) -> tuple[Path, ...]:
+    """Return this requester's existing instances among the enabled private agents."""
     if _MATRIX_USER_ID_PATTERN.fullmatch(requester_id) is None:
-        return False
+        return ()
+    roots: list[Path] = []
     for agent_name in _requested_agents(ctx.settings):
         agent_config = ctx.config.agents.get(agent_name)
         if agent_config is None or agent_config.private is None:
@@ -158,8 +165,43 @@ def _requester_has_enabled_private_instance(
             runtime_paths=ctx.runtime_paths,
         )
         if state_root is not None and state_root.is_dir():
-            return True
-    return False
+            roots.append(state_root)
+    return tuple(roots)
+
+
+def _requester_has_enabled_private_instance(
+    ctx: HookContext,
+    requester_id: str,
+) -> bool:
+    """Return whether this requester owns an existing enabled private instance."""
+    return bool(_enabled_private_instance_roots(ctx, requester_id))
+
+
+def _persist_private_instance_owner(
+    state_root: Path,
+    requester_id: str,
+    logger: BoundLogger,
+) -> bool:
+    """Durably remember this state root's requester without blocking exports on I/O failure."""
+    try:
+        write_json_file_durable(
+            state_root / PRIVATE_INSTANCE_OWNER_FILENAME,
+            {
+                "format": PRIVATE_INSTANCE_OWNER_FORMAT,
+                "version": PRIVATE_INSTANCE_OWNER_VERSION,
+                "requester_id": requester_id,
+            },
+            sort_keys=True,
+            trailing_newline=True,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Could not persist private instance owner",
+            instance_root=str(state_root),
+            error=str(exc),
+        )
+        return False
+    return True
 
 
 def _remember_private_instance_requester(
@@ -167,8 +209,16 @@ def _remember_private_instance_requester(
     requester_id: str,
 ) -> None:
     """Retain one requester only while they own an enabled private instance."""
-    if _requester_has_enabled_private_instance(ctx, requester_id):
-        _observed_requester_ids.add(requester_id)
+    state_roots = _enabled_private_instance_roots(ctx, requester_id)
+    if not state_roots:
+        return
+    for state_root in state_roots:
+        resolved_root = state_root.resolve()
+        if resolved_root not in _owner_marker_roots and _persist_private_instance_owner(
+            state_root, requester_id, ctx.logger
+        ):
+            _owner_marker_roots.add(resolved_root)
+    _observed_requester_ids.add(requester_id)
 
 
 def _prune_private_instance_requesters(ctx: HookContext) -> None:
@@ -179,6 +229,12 @@ def _prune_private_instance_requesters(ctx: HookContext) -> None:
         if _requester_has_enabled_private_instance(ctx, requester_id)
     }
     _observed_requester_ids.intersection_update(retained)
+    retained_roots = {
+        state_root.resolve()
+        for requester_id in retained
+        for state_root in _enabled_private_instance_roots(ctx, requester_id)
+    }
+    _owner_marker_roots.intersection_update(retained_roots)
 
 
 def _record_trigger(ctx: HookContext) -> None:
@@ -305,6 +361,41 @@ def _private_instance_owners(
     return owners
 
 
+def _persisted_private_instance_owner(
+    state_root: Path,
+    *,
+    agent_name: str,
+    worker_scope: WorkerScope,
+    runtime_paths: RuntimePaths,
+) -> str | None:
+    """Return a durable owner only when it resolves back to this private instance."""
+    marker_path = state_root / PRIVATE_INSTANCE_OWNER_FILENAME
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    requester_id = payload.get("requester_id")
+    if (
+        payload.get("format") != PRIVATE_INSTANCE_OWNER_FORMAT
+        or payload.get("version") != PRIVATE_INSTANCE_OWNER_VERSION
+        or not isinstance(requester_id, str)
+        or _MATRIX_USER_ID_PATTERN.fullmatch(requester_id) is None
+    ):
+        return None
+    candidate_root = private_instance_state_root_for_requester(
+        runtime_paths.storage_root,
+        requester_id=requester_id,
+        agent_name=agent_name,
+        worker_scope=worker_scope,
+        runtime_paths=runtime_paths,
+    )
+    if candidate_root is None or candidate_root.resolve() != state_root.resolve():
+        return None
+    return requester_id
+
+
 def _remove_export_tree(output_dir: Path) -> None:
     """Remove one plugin-owned export tree when its scope is revoked."""
     if output_dir.is_symlink() or output_dir.is_file():
@@ -366,10 +457,22 @@ def _private_agent_export_targets(
 ) -> tuple[ThreadExportTarget, ...]:
     """Return membership-scoped private targets, discovering orphans when requested."""
     owners = _private_instance_owners(env, agent_name, worker_scope)
+    persisted_owners: dict[Path, str] = {}
     if reconcile_instances:
         state_roots = _private_instance_state_roots(
             env.runtime_paths.storage_root, agent_name
         )
+        for state_root in state_roots:
+            resolved_root = state_root.resolve()
+            owner = _persisted_private_instance_owner(
+                state_root,
+                agent_name=agent_name,
+                worker_scope=worker_scope,
+                runtime_paths=env.runtime_paths,
+            )
+            if owner is not None:
+                persisted_owners[resolved_root] = owner
+                owners.setdefault(resolved_root, owner)
     else:
         state_roots = tuple(sorted(root for root in owners if root.is_dir()))
     if options.private_room_scope == "owner_and_agent" and agent_user_id is None:
@@ -387,7 +490,8 @@ def _private_agent_export_targets(
         output_dir = _private_workspace_export_dir(env, agent_name, state_root)
         if output_dir is None:
             continue
-        owner = owners.get(state_root.resolve())
+        resolved_root = state_root.resolve()
+        owner = owners.get(resolved_root)
         if owner is None:
             _remove_export_tree(output_dir)
             env.logger.warning(
@@ -396,6 +500,8 @@ def _private_agent_export_targets(
                 instance_root=str(state_root),
             )
             continue
+        if reconcile_instances and persisted_owners.get(resolved_root) != owner:
+            _persist_private_instance_owner(state_root, owner, env.logger)
         required_member_user_ids = (owner,)
         if options.private_room_scope == "owner_and_agent":
             assert agent_user_id is not None

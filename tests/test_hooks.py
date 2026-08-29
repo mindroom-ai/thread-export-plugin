@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import sys
 import threading
 from importlib import util
@@ -99,6 +100,7 @@ def _private_runtime(
     requester_ids: tuple[str, ...],
     *,
     persist_agent_identity: bool,
+    configured_requesters: bool = True,
 ) -> tuple[Config, RuntimePaths, dict[str, Path]]:
     """Build one private-agent runtime and its requester-scoped instance roots."""
     config = Config(
@@ -108,7 +110,7 @@ def _private_runtime(
                 private=AgentPrivateConfig(per="user"),
             ),
         },
-        administrators=list(requester_ids),
+        administrators=list(requester_ids) if configured_requesters else [],
     )
     runtime_paths = RuntimePaths(
         config_path=tmp_path / "config.yaml",
@@ -752,6 +754,216 @@ def test_private_instance_owner_candidates_use_membership_access_schema() -> Non
         "@router-user:hs",
         "@canonical:hs",
     )
+
+
+@pytest.mark.asyncio
+async def test_full_pass_recovers_unconfigured_private_owner_from_durable_marker(
+    tmp_path: Path,
+) -> None:
+    """A restart should recover an observed private owner without static config."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    owner = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (owner,),
+        persist_agent_identity=True,
+        configured_requesters=False,
+    )
+    instance_root = instance_roots[owner]
+    (instance_root / ".mindroom-thread-export-owner.json").write_text(
+        '{"format":"mindroom-thread-export-owner","version":1,'
+        '"requester_id":"@alice:hs"}\n',
+        encoding="utf-8",
+    )
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert len(targets) == 1
+    assert targets[0].required_member_user_ids == (
+        owner,
+        "@mindroom_secret:localhost",
+    )
+    assert targets[0].output_dir == instance_root / "secret_data" / "thread_exports"
+
+
+@pytest.mark.asyncio
+async def test_message_observation_persists_private_owner_for_restart(
+    tmp_path: Path,
+) -> None:
+    """The first real requester observation should make ownership restart-safe."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    owner = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (owner,),
+        persist_agent_identity=True,
+        configured_requesters=False,
+    )
+    ctx = SimpleNamespace(
+        envelope=SimpleNamespace(room_id="!room:hs", requester_id=owner),
+        settings={"agents": ["secret"], "debounce_seconds": 0},
+        config=config,
+        runtime_paths=runtime_paths,
+        logger=Mock(),
+    )
+
+    await module.queue_room_on_message(ctx)
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    marker_path = instance_roots[owner] / ".mindroom-thread-export-owner.json"
+    assert marker_path.exists()
+    assert json.loads(marker_path.read_text(encoding="utf-8")) == {
+        "format": "mindroom-thread-export-owner",
+        "version": 1,
+        "requester_id": owner,
+    }
+
+
+@pytest.mark.asyncio
+async def test_owner_marker_write_failure_does_not_block_current_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durability failure must not break an otherwise valid current response."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    owner = "@alice:hs"
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path,
+        (owner,),
+        persist_agent_identity=True,
+        configured_requesters=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "write_json_file_durable",
+        Mock(side_effect=OSError("read-only storage")),
+    )
+    ctx = SimpleNamespace(
+        envelope=SimpleNamespace(room_id="!room:hs", requester_id=owner),
+        settings={"agents": ["secret"], "debounce_seconds": 0},
+        config=config,
+        runtime_paths=runtime_paths,
+        logger=Mock(),
+    )
+
+    await module.queue_room_on_message(ctx)
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    module.export_threads_to_targets_once.assert_awaited_once()
+    assert owner in module._observed_requester_ids
+
+
+def test_owner_marker_write_retries_after_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later observation should retry a marker that could not be written."""
+    module = _load_hooks_module()
+    owner = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (owner,),
+        persist_agent_identity=True,
+        configured_requesters=False,
+    )
+    real_write = module.write_json_file_durable
+    attempts = 0
+
+    def flaky_write(*args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary storage failure")
+        real_write(*args, **kwargs)
+
+    monkeypatch.setattr(module, "write_json_file_durable", flaky_write)
+    ctx = SimpleNamespace(
+        settings={"agents": ["secret"]},
+        config=config,
+        runtime_paths=runtime_paths,
+        logger=Mock(),
+    )
+
+    module._remember_private_instance_requester(ctx, owner)
+    module._remember_private_instance_requester(ctx, owner)
+
+    marker_path = instance_roots[owner] / ".mindroom-thread-export-owner.json"
+    assert marker_path.exists()
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_full_pass_backfills_marker_for_configured_private_owner(
+    tmp_path: Path,
+) -> None:
+    """A known owner should gain durable recovery without another interaction."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    owner = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (owner,),
+        persist_agent_identity=True,
+    )
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    marker_path = instance_roots[owner] / ".mindroom-thread-export-owner.json"
+    assert marker_path.exists()
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["requester_id"] == owner
+
+
+@pytest.mark.asyncio
+async def test_full_pass_rejects_owner_marker_for_another_private_instance(
+    tmp_path: Path,
+) -> None:
+    """A forged owner marker must not widen a private workspace's room access."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        ("@alice:hs",),
+        persist_agent_identity=True,
+        configured_requesters=False,
+    )
+    instance_root = instance_roots["@alice:hs"]
+    (instance_root / ".mindroom-thread-export-owner.json").write_text(
+        '{"format":"mindroom-thread-export-owner","version":1,'
+        '"requester_id":"@bob:hs"}\n',
+        encoding="utf-8",
+    )
+    export_dir = instance_root / "secret_data" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
+    assert not export_dir.exists()
 
 
 @pytest.mark.asyncio
