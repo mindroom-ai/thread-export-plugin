@@ -906,6 +906,83 @@ async def test_conflicting_owner_marker_is_rejected_across_passes(
 
 
 @pytest.mark.asyncio
+async def test_owner_repair_during_full_pass_discards_stale_conflict(
+    tmp_path: Path,
+) -> None:
+    """A completed scan must not restore a conflict repaired while it was running."""
+    module = _load_hooks_module()
+    started = threading.Event()
+    release = threading.Event()
+
+    async def _blocking_export(
+        *, targets: tuple[object, ...], **_kwargs: object
+    ) -> tuple[Mock, ...]:
+        if not started.is_set():
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+        return _target_stats(targets=targets)
+
+    _autospec_export(module, side_effect=_blocking_export)
+    configured_owner = "@alice/test:hs"
+    marker_owner = "@alice_test:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (configured_owner,),
+        persist_agent_identity=True,
+    )
+    instance_root = instance_roots[configured_owner]
+    marker_root = private_instance_state_root_for_requester(
+        tmp_path,
+        requester_id=marker_owner,
+        agent_name="secret",
+        worker_scope="user",
+        runtime_paths=runtime_paths,
+    )
+    assert marker_root == instance_root
+    marker_path = instance_root / ".mindroom-thread-export-owner.json"
+    marker_path.write_text(
+        '{"format":"mindroom-thread-export-owner","version":1,'
+        '"requester_id":"@alice_test:hs"}\n',
+        encoding="utf-8",
+    )
+    settings = {"agents": ["secret"], "debounce_seconds": 0}
+    base_ctx = {
+        "settings": settings,
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "logger": Mock(),
+    }
+
+    await module.queue_initial_full_pass(SimpleNamespace(**base_ctx))
+    for _ in range(200):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.005)
+    assert started.is_set()
+
+    await module.queue_room_on_message(
+        SimpleNamespace(
+            envelope=SimpleNamespace(
+                room_id="!changed:hs", requester_id=configured_owner
+            ),
+            **base_ctx,
+        )
+    )
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["requester_id"] == (
+        configured_owner
+    )
+    release.set()
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (configured_owner, "@mindroom_secret:localhost"),
+    )
+
+
+@pytest.mark.asyncio
 async def test_message_observation_persists_private_owner_for_restart(
     tmp_path: Path,
 ) -> None:

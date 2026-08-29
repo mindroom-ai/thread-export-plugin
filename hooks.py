@@ -67,6 +67,7 @@ _pending_room_ids: set[str] = set()
 _observed_requester_ids: set[str] = set()
 _owner_marker_roots: set[Path] = set()
 _conflicting_owner_roots: set[Path] = set()
+_owner_marker_generation = 0
 _full_pass_pending = False
 _wakeup: asyncio.Event | None = None
 _latest_env: _TriggerEnv | None = None
@@ -211,6 +212,7 @@ def _remember_private_instance_requester(
     requester_id: str,
 ) -> None:
     """Retain one requester only while they own an enabled private instance."""
+    global _owner_marker_generation  # noqa: PLW0603
     state_roots = _enabled_private_instance_roots(ctx, requester_id)
     if not state_roots:
         return
@@ -225,6 +227,7 @@ def _remember_private_instance_requester(
         ):
             _owner_marker_roots.add(resolved_root)
             _conflicting_owner_roots.discard(resolved_root)
+            _owner_marker_generation += 1
     _observed_requester_ids.add(requester_id)
 
 
@@ -277,6 +280,7 @@ def _drain_pending() -> tuple[bool, frozenset[str]]:
 
 async def _run_export_loop() -> None:
     """Drain export triggers one debounced single-flight pass at a time."""
+    global _full_pass_pending  # noqa: PLW0603
     while True:
         assert _wakeup is not None  # noqa: S101 - created before this task starts
         await _wakeup.wait()
@@ -295,6 +299,7 @@ async def _run_export_loop() -> None:
             requester_candidates=tuple(_observed_requester_ids),
             conflicting_owner_roots=frozenset(_conflicting_owner_roots),
         )
+        owner_marker_generation = _owner_marker_generation
         try:
             recovered_requester_ids, conflicting_owner_roots = await asyncio.to_thread(
                 _run_export_pass_blocking, env, full_pass=full_pass, room_ids=room_ids
@@ -302,6 +307,11 @@ async def _run_export_loop() -> None:
         except Exception:
             env.logger.exception("Thread export pass crashed")
         else:
+            if full_pass and owner_marker_generation != _owner_marker_generation:
+                _full_pass_pending = True
+                assert _wakeup is not None  # noqa: S101 - runner owns this event
+                _wakeup.set()
+                continue
             _observed_requester_ids.update(recovered_requester_ids)
             if full_pass:
                 _conflicting_owner_roots.clear()
