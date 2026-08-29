@@ -843,6 +843,69 @@ async def test_recovered_private_owner_remains_in_incremental_passes(
 
 
 @pytest.mark.asyncio
+async def test_conflicting_owner_marker_is_rejected_across_passes(
+    tmp_path: Path,
+) -> None:
+    """A marker that collides with a configured owner must fail closed."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    configured_owner = "@alice/test:hs"
+    marker_owner = "@alice_test:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (configured_owner,),
+        persist_agent_identity=True,
+    )
+    instance_root = instance_roots[configured_owner]
+    marker_root = private_instance_state_root_for_requester(
+        tmp_path,
+        requester_id=marker_owner,
+        agent_name="secret",
+        worker_scope="user",
+        runtime_paths=runtime_paths,
+    )
+    assert marker_root == instance_root
+    (instance_root / ".mindroom-thread-export-owner.json").write_text(
+        '{"format":"mindroom-thread-export-owner","version":1,'
+        '"requester_id":"@alice_test:hs"}\n',
+        encoding="utf-8",
+    )
+    export_dir = instance_root / "secret_data" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    settings = {"agents": ["secret"], "debounce_seconds": 0}
+    base_ctx = {
+        "settings": settings,
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "logger": Mock(),
+    }
+
+    await module.queue_initial_full_pass(SimpleNamespace(**base_ctx))
+    await _drain(module)
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert targets == ()
+    assert not export_dir.exists()
+    assert marker_owner not in module._observed_requester_ids
+
+    module.export_threads_to_targets_once.reset_mock()
+    await module.queue_room_on_message(
+        SimpleNamespace(
+            envelope=SimpleNamespace(
+                room_id="!changed:hs", requester_id="@unrelated:hs"
+            ),
+            **base_ctx,
+        )
+    )
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert targets == ()
+
+
+@pytest.mark.asyncio
 async def test_message_observation_persists_private_owner_for_restart(
     tmp_path: Path,
 ) -> None:

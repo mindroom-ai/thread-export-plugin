@@ -66,6 +66,7 @@ _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
 _observed_requester_ids: set[str] = set()
 _owner_marker_roots: set[Path] = set()
+_conflicting_owner_roots: set[Path] = set()
 _full_pass_pending = False
 _wakeup: asyncio.Event | None = None
 _latest_env: _TriggerEnv | None = None
@@ -87,6 +88,7 @@ class _TriggerEnv:
     settings: Mapping[str, object]
     logger: BoundLogger
     requester_candidates: tuple[str, ...] = ()
+    conflicting_owner_roots: frozenset[Path] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -214,10 +216,15 @@ def _remember_private_instance_requester(
         return
     for state_root in state_roots:
         resolved_root = state_root.resolve()
-        if resolved_root not in _owner_marker_roots and _persist_private_instance_owner(
+        marker_needs_write = (
+            resolved_root not in _owner_marker_roots
+            or resolved_root in _conflicting_owner_roots
+        )
+        if marker_needs_write and _persist_private_instance_owner(
             state_root, requester_id, ctx.logger
         ):
             _owner_marker_roots.add(resolved_root)
+            _conflicting_owner_roots.discard(resolved_root)
     _observed_requester_ids.add(requester_id)
 
 
@@ -246,6 +253,7 @@ def _record_trigger(ctx: HookContext) -> None:
         settings=ctx.settings,
         logger=ctx.logger,
         requester_candidates=tuple(_observed_requester_ids),
+        conflicting_owner_roots=frozenset(_conflicting_owner_roots),
     )
     if _wakeup is None:
         _wakeup = asyncio.Event()
@@ -285,20 +293,24 @@ async def _run_export_loop() -> None:
         env = replace(
             _latest_env or env,
             requester_candidates=tuple(_observed_requester_ids),
+            conflicting_owner_roots=frozenset(_conflicting_owner_roots),
         )
         try:
-            recovered_requester_ids = await asyncio.to_thread(
+            recovered_requester_ids, conflicting_owner_roots = await asyncio.to_thread(
                 _run_export_pass_blocking, env, full_pass=full_pass, room_ids=room_ids
             )
         except Exception:
             env.logger.exception("Thread export pass crashed")
         else:
             _observed_requester_ids.update(recovered_requester_ids)
+            if full_pass:
+                _conflicting_owner_roots.clear()
+                _conflicting_owner_roots.update(conflicting_owner_roots)
 
 
 def _run_export_pass_blocking(
     env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[Path, ...]]:
     """Run one export pass to completion on a private event loop in the calling thread."""
     with _EXPORT_PASS_LOCK:
         return asyncio.run(
@@ -462,6 +474,7 @@ def _private_agent_export_targets(
     worker_scope: WorkerScope,
     reconcile_instances: bool,
     recovered_requester_ids: set[str],
+    conflicting_owner_roots: set[Path],
 ) -> tuple[ThreadExportTarget, ...]:
     """Return membership-scoped private targets, discovering orphans when requested."""
     owners = _private_instance_owners(env, agent_name, worker_scope)
@@ -479,8 +492,13 @@ def _private_agent_export_targets(
                 runtime_paths=env.runtime_paths,
             )
             if owner is not None:
+                configured_owner = owners.get(resolved_root)
+                if configured_owner is not None and configured_owner != owner:
+                    owners.pop(resolved_root)
+                    conflicting_owner_roots.add(resolved_root)
+                    continue
                 persisted_owners[resolved_root] = owner
-                owners.setdefault(resolved_root, owner)
+                owners[resolved_root] = owner
                 recovered_requester_ids.add(owner)
     else:
         state_roots = tuple(sorted(root for root in owners if root.is_dir()))
@@ -495,11 +513,22 @@ def _private_agent_export_targets(
         )
         return ()
     targets: list[ThreadExportTarget] = []
+    active_conflicts = (
+        conflicting_owner_roots if reconcile_instances else env.conflicting_owner_roots
+    )
     for state_root in state_roots:
         output_dir = _private_workspace_export_dir(env, agent_name, state_root)
         if output_dir is None:
             continue
         resolved_root = state_root.resolve()
+        if resolved_root in active_conflicts:
+            _remove_export_tree(output_dir)
+            env.logger.warning(
+                "Skipping private instance with conflicting owners",
+                agent_name=agent_name,
+                instance_root=str(state_root),
+            )
+            continue
         owner = owners.get(resolved_root)
         if owner is None:
             _remove_export_tree(output_dir)
@@ -532,6 +561,7 @@ def _agent_export_targets(
     options: _AgentExportSettings,
     reconcile_private_instances: bool,
     recovered_requester_ids: set[str],
+    conflicting_owner_roots: set[Path],
 ) -> tuple[ThreadExportTarget, ...]:
     """Return shared or requester-private export targets for one configured agent."""
     agent_config = env.config.agents.get(agent_name)
@@ -557,6 +587,7 @@ def _agent_export_targets(
         worker_scope=agent_config.private.per,
         reconcile_instances=reconcile_private_instances,
         recovered_requester_ids=recovered_requester_ids,
+        conflicting_owner_roots=conflicting_owner_roots,
     )
 
 
@@ -583,9 +614,10 @@ def _cleanup_disabled_agent_exports(
 
 async def _run_export_pass(
     env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[Path, ...]]:
     """Export the dirty rooms (or everything) into every enabled agent's workspace."""
     recovered_requester_ids: set[str] = set()
+    conflicting_owner_roots: set[Path] = set()
     requested = _requested_agents(env.settings)
     enabled = {
         name: options
@@ -611,6 +643,7 @@ async def _run_export_pass(
             options=options,
             reconcile_private_instances=full_pass,
             recovered_requester_ids=recovered_requester_ids,
+            conflicting_owner_roots=conflicting_owner_roots,
         )
     ]
     targets = tuple(target for _, target, _ in target_records)
@@ -650,7 +683,10 @@ async def _run_export_pass(
                 threads_unchanged=stats.threads_unchanged,
                 failures=stats.failures,
             )
-    return tuple(sorted(recovered_requester_ids))
+    return (
+        tuple(sorted(recovered_requester_ids)),
+        tuple(sorted(conflicting_owner_roots)),
+    )
 
 
 @hook(event="bot:ready", name="thread-export-startup", agents=(ROUTER_AGENT_NAME,))
