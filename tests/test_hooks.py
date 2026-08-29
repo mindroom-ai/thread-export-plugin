@@ -339,6 +339,82 @@ async def test_agent_mapping_settings_control_invited_rooms(tmp_path: Path) -> N
     }
 
 
+@pytest.mark.asyncio
+async def test_incremental_pass_logs_only_targets_with_activity(tmp_path: Path) -> None:
+    """Dirty-room passes should not emit one no-op log per unrelated target."""
+    module = _load_hooks_module()
+
+    async def _activity_stats(**_kwargs: object) -> tuple[Mock, Mock]:
+        return (
+            Mock(
+                rooms_exported=0,
+                threads_exported=0,
+                threads_unchanged=0,
+                failures=0,
+            ),
+            Mock(
+                rooms_exported=1,
+                threads_exported=3,
+                threads_unchanged=3,
+                failures=0,
+            ),
+        )
+
+    _autospec_export(module, side_effect=_activity_stats)
+    logger = Mock()
+    config, runtime_paths = _shared_runtime(tmp_path)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["code", "research"]},
+        logger=logger,
+    )
+
+    await module._run_export_pass(
+        env,
+        full_pass=False,
+        room_ids=frozenset({"!changed:hs"}),
+    )
+
+    logger.info.assert_called_once()
+    assert logger.info.call_args.kwargs["agent_name"] == "research"
+
+
+@pytest.mark.asyncio
+async def test_full_pass_logs_targets_without_activity(tmp_path: Path) -> None:
+    """Full reconciliation should retain a completion log for every target."""
+    module = _load_hooks_module()
+
+    async def _no_activity_stats(**_kwargs: object) -> tuple[Mock]:
+        return (
+            Mock(
+                rooms_exported=0,
+                threads_exported=0,
+                threads_unchanged=0,
+                failures=0,
+            ),
+        )
+
+    _autospec_export(module, side_effect=_no_activity_stats)
+    logger = Mock()
+    config, runtime_paths = _shared_runtime(tmp_path)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["code"]},
+        logger=logger,
+    )
+
+    await module._run_export_pass(
+        env,
+        full_pass=True,
+        room_ids=frozenset(),
+    )
+
+    logger.info.assert_called_once()
+    assert logger.info.call_args.kwargs["agent_name"] == "code"
+
+
 def test_unknown_private_room_scope_defaults_to_intersection() -> None:
     """A misspelled private scope must not silently widen exported room access."""
     module = _load_hooks_module()
@@ -725,6 +801,48 @@ async def test_private_agent_exports_require_owner_and_agent_membership_by_defau
     ]
     assert len(orphan_warnings) == 1
     assert "ghost-0000000000000000" in orphan_warnings[0].kwargs["instance_root"]
+
+
+@pytest.mark.asyncio
+async def test_incremental_pass_ignores_unresolved_private_instances(
+    tmp_path: Path,
+) -> None:
+    """Dirty-room exports should defer orphan discovery and cleanup to full passes."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        ("@alice:hs",),
+        persist_agent_identity=True,
+    )
+    ghost_root = tmp_path / "private_instances" / "ghost-0000000000000000" / "secret"
+    ghost_export_dir = ghost_root / "secret_data" / "thread_exports"
+    ghost_export_dir.mkdir(parents=True)
+    (ghost_export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    logger = Mock()
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=logger,
+    )
+
+    await module._run_export_pass(
+        env,
+        full_pass=False,
+        room_ids=frozenset({"!changed:hs"}),
+    )
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert len(targets) == 1
+    assert targets[0].output_dir == (
+        instance_roots["@alice:hs"] / "secret_data" / "thread_exports"
+    )
+    assert ghost_export_dir.is_dir()
+    assert not any(
+        "without resolvable owner" in call.args[0]
+        for call in logger.warning.call_args_list
+    )
 
 
 @pytest.mark.asyncio
