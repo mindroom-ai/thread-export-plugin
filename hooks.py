@@ -19,7 +19,7 @@ import re
 import shutil
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, cast
 
 import mindroom.thread_export as thread_export_pkg
@@ -282,21 +282,28 @@ async def _run_export_loop() -> None:
         full_pass, room_ids = _drain_pending()
         if not full_pass and not room_ids:
             continue
-        env = _latest_env or env
+        env = replace(
+            _latest_env or env,
+            requester_candidates=tuple(_observed_requester_ids),
+        )
         try:
-            await asyncio.to_thread(
+            recovered_requester_ids = await asyncio.to_thread(
                 _run_export_pass_blocking, env, full_pass=full_pass, room_ids=room_ids
             )
         except Exception:
             env.logger.exception("Thread export pass crashed")
+        else:
+            _observed_requester_ids.update(recovered_requester_ids)
 
 
 def _run_export_pass_blocking(
     env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
-) -> None:
+) -> tuple[str, ...]:
     """Run one export pass to completion on a private event loop in the calling thread."""
     with _EXPORT_PASS_LOCK:
-        asyncio.run(_run_export_pass(env, full_pass=full_pass, room_ids=room_ids))
+        return asyncio.run(
+            _run_export_pass(env, full_pass=full_pass, room_ids=room_ids)
+        )
 
 
 def _private_instance_state_roots(
@@ -454,6 +461,7 @@ def _private_agent_export_targets(
     options: _AgentExportSettings,
     worker_scope: WorkerScope,
     reconcile_instances: bool,
+    recovered_requester_ids: set[str],
 ) -> tuple[ThreadExportTarget, ...]:
     """Return membership-scoped private targets, discovering orphans when requested."""
     owners = _private_instance_owners(env, agent_name, worker_scope)
@@ -473,6 +481,7 @@ def _private_agent_export_targets(
             if owner is not None:
                 persisted_owners[resolved_root] = owner
                 owners.setdefault(resolved_root, owner)
+                recovered_requester_ids.add(owner)
     else:
         state_roots = tuple(sorted(root for root in owners if root.is_dir()))
     if options.private_room_scope == "owner_and_agent" and agent_user_id is None:
@@ -522,6 +531,7 @@ def _agent_export_targets(
     *,
     options: _AgentExportSettings,
     reconcile_private_instances: bool,
+    recovered_requester_ids: set[str],
 ) -> tuple[ThreadExportTarget, ...]:
     """Return shared or requester-private export targets for one configured agent."""
     agent_config = env.config.agents.get(agent_name)
@@ -546,6 +556,7 @@ def _agent_export_targets(
         options=options,
         worker_scope=agent_config.private.per,
         reconcile_instances=reconcile_private_instances,
+        recovered_requester_ids=recovered_requester_ids,
     )
 
 
@@ -572,8 +583,9 @@ def _cleanup_disabled_agent_exports(
 
 async def _run_export_pass(
     env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
-) -> None:
+) -> tuple[str, ...]:
     """Export the dirty rooms (or everything) into every enabled agent's workspace."""
+    recovered_requester_ids: set[str] = set()
     requested = _requested_agents(env.settings)
     enabled = {
         name: options
@@ -598,6 +610,7 @@ async def _run_export_pass(
             agent_name,
             options=options,
             reconcile_private_instances=full_pass,
+            recovered_requester_ids=recovered_requester_ids,
         )
     ]
     targets = tuple(target for _, target, _ in target_records)
@@ -637,6 +650,7 @@ async def _run_export_pass(
                 threads_unchanged=stats.threads_unchanged,
                 failures=stats.failures,
             )
+    return tuple(sorted(recovered_requester_ids))
 
 
 @hook(event="bot:ready", name="thread-export-startup", agents=(ROUTER_AGENT_NAME,))

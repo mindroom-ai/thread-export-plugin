@@ -795,6 +795,54 @@ async def test_full_pass_recovers_unconfigured_private_owner_from_durable_marker
 
 
 @pytest.mark.asyncio
+async def test_recovered_private_owner_remains_in_incremental_passes(
+    tmp_path: Path,
+) -> None:
+    """Startup recovery should retain an owner for later unrelated room updates."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    owner = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (owner,),
+        persist_agent_identity=True,
+        configured_requesters=False,
+    )
+    (instance_roots[owner] / ".mindroom-thread-export-owner.json").write_text(
+        '{"format":"mindroom-thread-export-owner","version":1,'
+        '"requester_id":"@alice:hs"}\n',
+        encoding="utf-8",
+    )
+    settings = {"agents": ["secret"], "debounce_seconds": 0}
+    base_ctx = {
+        "settings": settings,
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "logger": Mock(),
+    }
+
+    await module.queue_initial_full_pass(SimpleNamespace(**base_ctx))
+    await _drain(module)
+    module.export_threads_to_targets_once.reset_mock()
+
+    await module.queue_room_on_message(
+        SimpleNamespace(
+            envelope=SimpleNamespace(
+                room_id="!changed:hs", requester_id="@unrelated:hs"
+            ),
+            **base_ctx,
+        )
+    )
+    await _drain(module)
+    await _shutdown_runner(module)
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (owner, "@mindroom_secret:localhost"),
+    )
+
+
+@pytest.mark.asyncio
 async def test_message_observation_persists_private_owner_for_restart(
     tmp_path: Path,
 ) -> None:
