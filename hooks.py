@@ -54,6 +54,7 @@ _MATRIX_USER_ID_PATTERN = re.compile(r"@[^:\s]+:\S+")
 
 _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
+_observed_requester_ids: set[str] = set()
 _full_pass_pending = False
 _wakeup: asyncio.Event | None = None
 _latest_env: _TriggerEnv | None = None
@@ -74,6 +75,7 @@ class _TriggerEnv:
     runtime_paths: RuntimePaths
     settings: Mapping[str, object]
     logger: BoundLogger
+    requester_candidates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,48 @@ def _debounce_seconds(settings: Mapping[str, object]) -> float:
     return DEFAULT_DEBOUNCE_SECONDS
 
 
+def _requester_has_enabled_private_instance(
+    ctx: HookContext,
+    requester_id: str,
+) -> bool:
+    """Return whether this requester owns an existing enabled private instance."""
+    if _MATRIX_USER_ID_PATTERN.fullmatch(requester_id) is None:
+        return False
+    for agent_name in _requested_agents(ctx.settings):
+        agent_config = ctx.config.agents.get(agent_name)
+        if agent_config is None or agent_config.private is None:
+            continue
+        state_root = private_instance_state_root_for_requester(
+            ctx.runtime_paths.storage_root,
+            requester_id=requester_id,
+            agent_name=agent_name,
+            worker_scope=agent_config.private.per,
+            runtime_paths=ctx.runtime_paths,
+        )
+        if state_root is not None and state_root.is_dir():
+            return True
+    return False
+
+
+def _remember_private_instance_requester(
+    ctx: HookContext,
+    requester_id: str,
+) -> None:
+    """Retain one requester only while they own an enabled private instance."""
+    if _requester_has_enabled_private_instance(ctx, requester_id):
+        _observed_requester_ids.add(requester_id)
+
+
+def _prune_private_instance_requesters(ctx: HookContext) -> None:
+    """Drop observed requesters whose enabled private instances no longer exist."""
+    retained = {
+        requester_id
+        for requester_id in _observed_requester_ids
+        if _requester_has_enabled_private_instance(ctx, requester_id)
+    }
+    _observed_requester_ids.intersection_update(retained)
+
+
 def _record_trigger(ctx: HookContext) -> None:
     """Capture the trigger context and wake the runner, starting it when needed."""
     global _latest_env, _wakeup  # noqa: PLW0603
@@ -130,6 +174,7 @@ def _record_trigger(ctx: HookContext) -> None:
         runtime_paths=ctx.runtime_paths,
         settings=ctx.settings,
         logger=ctx.logger,
+        requester_candidates=tuple(_observed_requester_ids),
     )
     if _wakeup is None:
         _wakeup = asyncio.Event()
@@ -227,9 +272,12 @@ def _authorized_requester_candidates(config: Config) -> tuple[str, ...]:
 def _private_instance_owners(
     env: _TriggerEnv, agent_name: str, worker_scope: str
 ) -> dict[Path, str]:
-    """Map existing private-instance state roots to the authorized requester that owns them."""
+    """Map private-instance roots to statically configured or observed requesters."""
     owners: dict[Path, str] = {}
-    for requester_id in _authorized_requester_candidates(env.config):
+    requester_candidates = dict.fromkeys(
+        (*_authorized_requester_candidates(env.config), *env.requester_candidates)
+    )
+    for requester_id in requester_candidates:
         candidate_root = private_instance_state_root_for_requester(
             env.runtime_paths.storage_root,
             requester_id=requester_id,
@@ -273,7 +321,7 @@ def _agent_export_targets(
     """Return export targets for one agent: shared workspace, or one owner-scoped target per instance.
 
     Private instances export only rooms their owner is a member of; instances whose owner cannot be
-    resolved from statically configured membership-access identities are skipped entirely.
+    resolved from statically configured or observed requester identities are skipped entirely.
     """
     agent_config = env.config.agents.get(agent_name)
     if agent_config is None:
@@ -413,6 +461,7 @@ async def _run_export_pass(
 async def queue_initial_full_pass(ctx: AgentLifecycleContext) -> None:
     """Queue one full export pass once the router bot is ready."""
     global _full_pass_pending  # noqa: PLW0603
+    _prune_private_instance_requesters(ctx)
     _full_pass_pending = True
     _record_trigger(ctx)
 
@@ -421,6 +470,7 @@ async def queue_initial_full_pass(ctx: AgentLifecycleContext) -> None:
 async def queue_full_pass_after_config_reload(ctx: ConfigReloadedContext) -> None:
     """Queue a full pass after hot reload, including cleanup for removed agent settings."""
     global _full_pass_pending  # noqa: PLW0603
+    _prune_private_instance_requesters(ctx)
     _full_pass_pending = True
     _record_trigger(ctx)
 
@@ -430,6 +480,7 @@ async def queue_room_on_message(ctx: MessageReceivedContext) -> None:
     """Queue the message's room for re-export."""
     if not _requested_agents(ctx.settings):
         return
+    _remember_private_instance_requester(ctx, ctx.envelope.requester_id)
     _pending_room_ids.add(ctx.envelope.room_id)
     _record_trigger(ctx)
 
@@ -441,5 +492,6 @@ async def queue_room_after_response(ctx: AfterResponseContext) -> None:
     """Queue the responded room for re-export."""
     if not _requested_agents(ctx.settings):
         return
+    _remember_private_instance_requester(ctx, ctx.result.envelope.requester_id)
     _pending_room_ids.add(ctx.result.envelope.room_id)
     _record_trigger(ctx)
