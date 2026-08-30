@@ -76,11 +76,11 @@ Private agents (`private:` config) are supported: every existing private instanc
 <storage_root>/private_instances/<worker scope>/<agent>/<private root>/thread_exports/...
 ```
 
-Instances are discovered on disk, so a brand-new requester's instance starts receiving exports from the first pass after the instance is created.
+Instances are discovered from their core identity records, so a brand-new requester's instance starts receiving exports after its runtime has been materialized.
 
 Shared-agent exports are scoped to the enabled agent's current room memberships.
 Private-instance exports are scoped to the owner's current memberships, so one requester's private workspace never accumulates other users' conversations.
-Instance owners are resolved by matching instance directories against Matrix user IDs from `administrators`, room invitation policies, responder `access.users`, canonical alias entries, and requesters observed by the message and response hooks. Only observed requesters with an existing enabled private instance are retained, and startup or config reload prunes identities whose instance no longer exists. An existing unlisted owner's instance starts receiving exports after that owner next sends a message. Instances whose owner cannot be resolved have their prior exports removed and are skipped with a warning in the logs.
+Each private instance is authorized only when its core identity record names a valid Matrix requester and forward-resolves to that instance's state root. The plugin retains only validated roots observed by message and response hooks; startup and configuration reload rebuild that bounded in-memory index from the core records. Missing, unreadable, malformed, or mismatched records remove prior exports and prevent new ones.
 Membership lookup failures block new exports for that room and are reported, while previously authorized files remain until a successful lookup definitively proves that access was revoked.
 
 ## Semantic Search Over Exports

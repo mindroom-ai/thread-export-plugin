@@ -15,22 +15,16 @@ from unittest.mock import Mock, create_autospec
 
 import pytest
 
-from mindroom.config.access import ResponderAccessConfig, RoomDefaultsConfig
-from mindroom.config.agent import (
-    AgentConfig,
-    AgentPrivateConfig,
-    RoomConfig,
-    TeamConfig,
-)
-from mindroom.config.auth import AuthorizationConfig
+from mindroom.config.access import ResponderAccessConfig
+from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.main import Config
-from mindroom.config.models import RouterConfig
 from mindroom.constants import RuntimePaths
 from mindroom.hooks.decorators import get_hook_metadata
 from mindroom.matrix.identity import managed_account_key
 from mindroom.matrix.state import MatrixState
+from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.tool_system.worker_routing import (
-    private_instance_state_root_for_requester,
+    ToolExecutionIdentity,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +93,7 @@ def _private_runtime(
     requester_ids: tuple[str, ...],
     *,
     persist_agent_identity: bool,
+    authorize_requesters: bool = True,
 ) -> tuple[Config, RuntimePaths, dict[str, Path]]:
     """Build one private-agent runtime and its requester-scoped instance roots."""
     config = Config(
@@ -108,7 +103,7 @@ def _private_runtime(
                 private=AgentPrivateConfig(per="user"),
             ),
         },
-        administrators=list(requester_ids),
+        administrators=list(requester_ids) if authorize_requesters else [],
     )
     runtime_paths = RuntimePaths(
         config_path=tmp_path / "config.yaml",
@@ -127,17 +122,35 @@ def _private_runtime(
         state.save(runtime_paths)
     instance_roots: dict[str, Path] = {}
     for requester_id in requester_ids:
-        instance_root = private_instance_state_root_for_requester(
-            tmp_path,
-            requester_id=requester_id,
-            agent_name="secret",
-            worker_scope="user",
-            runtime_paths=runtime_paths,
+        instance_roots[requester_id] = _materialize_private_instance(
+            config, runtime_paths, requester_id
         )
-        assert instance_root is not None
-        instance_root.mkdir(parents=True)
-        instance_roots[requester_id] = instance_root
     return config, runtime_paths, instance_roots
+
+
+def _materialize_private_instance(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    requester_id: str,
+    *,
+    agent_name: str = "secret",
+) -> Path:
+    """Create a private runtime through the core materialization boundary."""
+    return resolve_agent_runtime(
+        agent_name,
+        config,
+        runtime_paths,
+        ToolExecutionIdentity(
+            channel="matrix",
+            agent_name=agent_name,
+            requester_id=requester_id,
+            room_id="!private:hs",
+            thread_id="thread",
+            resolved_thread_id="thread",
+            session_id="session",
+        ),
+        create=True,
+    ).state_root
 
 
 def _base_ctx(tmp_path: Path, settings: dict[str, object]) -> dict[str, object]:
@@ -663,10 +676,10 @@ async def test_private_agent_without_persisted_identity_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_all_underscore_private_agent_uses_canonical_state_root(
+async def test_private_agent_with_mismatched_forwarded_root_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """A valid all-underscore agent should use its runtime-normalized state root."""
+    """A root that cannot be forward-resolved must not receive exports."""
     module = _load_hooks_module()
     _autospec_export(module, side_effect=_target_stats)
     agent_name = "___"
@@ -694,16 +707,9 @@ async def test_all_underscore_private_agent_uses_canonical_state_root(
         domain="localhost",
     )
     state.save(runtime_paths)
-    instance_root = private_instance_state_root_for_requester(
-        tmp_path,
-        requester_id=requester_id,
-        agent_name=agent_name,
-        worker_scope="user",
-        runtime_paths=runtime_paths,
+    _materialize_private_instance(
+        config, runtime_paths, requester_id, agent_name=agent_name
     )
-    assert instance_root is not None
-    assert instance_root.name == "worker"
-    instance_root.mkdir(parents=True)
     env = module._TriggerEnv(
         config=config,
         runtime_paths=runtime_paths,
@@ -713,45 +719,7 @@ async def test_all_underscore_private_agent_uses_canonical_state_root(
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
-    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
-    assert len(targets) == 1
-    assert targets[0].output_dir == (instance_root / "____data" / "thread_exports")
-
-
-def test_private_instance_owner_candidates_use_membership_access_schema() -> None:
-    """Private-owner discovery should use every statically authored requester source."""
-    module = _load_hooks_module()
-    config = Config(
-        administrators=["@admin:hs"],
-        room_defaults=RoomDefaultsConfig(invite_users=["@default-member:hs"]),
-        rooms={"project": RoomConfig(invite_users=["@project-member:hs"])},
-        agents={
-            "secret": AgentConfig(
-                display_name="Secret",
-                access=ResponderAccessConfig(users=["@agent-user:hs", "@admin:hs"]),
-            ),
-        },
-        teams={
-            "reviewers": TeamConfig(
-                display_name="Reviewers",
-                role="Review exports",
-                agents=["secret"],
-                access=ResponderAccessConfig(users=["@team-user:hs"]),
-            ),
-        },
-        router=RouterConfig(access=ResponderAccessConfig(users=["@router-user:hs"])),
-        authorization=AuthorizationConfig(aliases={"@canonical:hs": ["@bridge:hs"]}),
-    )
-
-    assert module._authorized_requester_candidates(config) == (
-        "@admin:hs",
-        "@default-member:hs",
-        "@project-member:hs",
-        "@agent-user:hs",
-        "@team-user:hs",
-        "@router-user:hs",
-        "@canonical:hs",
-    )
+    assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
 
 
 @pytest.mark.asyncio
@@ -797,10 +765,211 @@ async def test_private_agent_exports_require_owner_and_agent_membership_by_defau
     orphan_warnings = [
         call
         for call in logger.warning.call_args_list
-        if "without resolvable owner" in call.args[0]
+        if "without valid core identity" in call.args[0]
     ]
     assert len(orphan_warnings) == 1
     assert "ghost-0000000000000000" in orphan_warnings[0].kwargs["instance_root"]
+
+
+@pytest.mark.asyncio
+async def test_full_pass_recovers_unconfigured_private_requester_from_core_identity(
+    tmp_path: Path,
+) -> None:
+    """A reload must discover a materialized private instance without config hints."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    requester_id = "@unconfigured:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+        authorize_requesters=False,
+    )
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (requester_id, "@mindroom_secret:localhost"),
+    )
+    assert targets[0].output_dir == (
+        instance_roots[requester_id] / "secret_data" / "thread_exports"
+    )
+
+
+@pytest.mark.asyncio
+async def test_private_exports_do_not_create_private_owner_metadata(
+    tmp_path: Path,
+) -> None:
+    """Exporting a materialized private root must leave its core scope unchanged."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    requester_id = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path, (requester_id,), persist_agent_identity=True
+    )
+    instance_root = instance_roots[requester_id]
+    scope_entries = {entry.name for entry in instance_root.parent.iterdir()}
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert {entry.name for entry in instance_root.parent.iterdir()} == scope_entries
+
+
+@pytest.mark.asyncio
+async def test_missing_core_identity_removes_stale_private_exports(
+    tmp_path: Path,
+) -> None:
+    """A private root without core identity must not retain prior export files."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    requester_id = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path, (requester_id,), persist_agent_identity=True
+    )
+    instance_root = instance_roots[requester_id]
+    export_dir = instance_root / "secret_data" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("old", encoding="utf-8")
+    (instance_root.parent / ".mindroom-private-instance.json").unlink()
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert not export_dir.exists()
+    assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_record", ["{not-json", "mismatched"])
+async def test_invalid_core_identity_removes_stale_private_exports(
+    tmp_path: Path, invalid_record: str
+) -> None:
+    """Malformed and mismatched core identities must both fail closed."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    requester_id = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path, (requester_id, "@bob:hs"), persist_agent_identity=True
+    )
+    instance_root = instance_roots[requester_id]
+    export_dir = instance_root / "secret_data" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("old", encoding="utf-8")
+    record_path = instance_root.parent / ".mindroom-private-instance.json"
+    if invalid_record == "mismatched":
+        record_path.write_text(
+            (
+                instance_roots["@bob:hs"].parent / ".mindroom-private-instance.json"
+            ).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    else:
+        record_path.write_text(invalid_record, encoding="utf-8")
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert not export_dir.exists()
+    assert tuple(
+        target.required_member_user_ids
+        for target in module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    ) == (("@bob:hs", "@mindroom_secret:localhost"),)
+
+
+@pytest.mark.asyncio
+async def test_private_requester_observed_during_full_pass_survives_incremental_export(
+    tmp_path: Path,
+) -> None:
+    """A full-pass snapshot must not discard a requester learned by a hook mid-pass."""
+    module = _load_hooks_module()
+    requester_id = "@first:hs"
+    later_requester_id = "@later:hs"
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+        authorize_requesters=False,
+    )
+    later_root = _materialize_private_instance(
+        config, runtime_paths, later_requester_id
+    )
+    export_once = module.export_threads_to_targets_once
+    _autospec_export(module, side_effect=_target_stats)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"], "debounce_seconds": 0},
+        logger=Mock(),
+    )
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+    started = threading.Event()
+    release = threading.Event()
+
+    async def pause_full_pass(
+        *, targets: tuple[object, ...], **_kwargs: object
+    ) -> tuple[Mock, ...]:
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return _target_stats(targets=targets)
+
+    module.export_threads_to_targets_once = create_autospec(
+        export_once, spec_set=True, side_effect=pause_full_pass
+    )
+    pass_task = asyncio.create_task(
+        asyncio.to_thread(
+            module._run_export_pass_blocking,
+            env,
+            full_pass=True,
+            room_ids=frozenset(),
+        )
+    )
+    await asyncio.to_thread(started.wait)
+    module._remember_private_instance_requester(
+        SimpleNamespace(
+            config=config,
+            runtime_paths=runtime_paths,
+            settings=env.settings,
+            logger=env.logger,
+        ),
+        later_requester_id,
+    )
+    release.set()
+    await pass_task
+    module.export_threads_to_targets_once = create_autospec(
+        export_once, spec_set=True, side_effect=_target_stats
+    )
+
+    await module._run_export_pass(
+        env, full_pass=False, room_ids=frozenset({"!changed:hs"})
+    )
+
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert later_root / "secret_data" / "thread_exports" in {
+        target.output_dir for target in targets
+    }
 
 
 @pytest.mark.asyncio
@@ -826,6 +995,15 @@ async def test_incremental_pass_ignores_unresolved_private_instances(
         settings={"agents": ["secret"]},
         logger=logger,
     )
+    module._remember_private_instance_requester(
+        SimpleNamespace(
+            config=config,
+            runtime_paths=runtime_paths,
+            settings=env.settings,
+            logger=logger,
+        ),
+        "@alice:hs",
+    )
 
     await module._run_export_pass(
         env,
@@ -840,7 +1018,7 @@ async def test_incremental_pass_ignores_unresolved_private_instances(
     )
     assert ghost_export_dir.is_dir()
     assert not any(
-        "without resolvable owner" in call.args[0]
+        "without valid core identity" in call.args[0]
         for call in logger.warning.call_args_list
     )
 
@@ -893,15 +1071,7 @@ async def test_message_requester_resolves_unlisted_private_owner(
         storage_root=tmp_path, env_value=lambda _name, default=None: default
     )
     requester_id = "@alice:hs"
-    instance_root = private_instance_state_root_for_requester(
-        tmp_path,
-        requester_id=requester_id,
-        agent_name="secret",
-        worker_scope="user_agent",
-        runtime_paths=runtime_paths,
-    )
-    assert instance_root is not None
-    instance_root.mkdir(parents=True)
+    instance_root = _materialize_private_instance(config, runtime_paths, requester_id)
     ctx = SimpleNamespace(
         envelope=SimpleNamespace(room_id="!private:hs", requester_id=requester_id),
         settings={
@@ -955,7 +1125,7 @@ async def test_message_requester_without_private_instance_is_not_retained(
     await _drain(module)
     await _shutdown_runner(module)
 
-    assert module._observed_requester_ids == set()
+    assert module._private_instance_requesters == {}
 
 
 @pytest.mark.asyncio
@@ -990,17 +1160,8 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
 
     await module.queue_room_on_message(message_ctx)
     await _drain(module)
-    module._observed_requester_ids.clear()
 
-    instance_root = private_instance_state_root_for_requester(
-        tmp_path,
-        requester_id=requester_id,
-        agent_name="secret",
-        worker_scope="user_agent",
-        runtime_paths=runtime_paths,
-    )
-    assert instance_root is not None
-    instance_root.mkdir(parents=True)
+    _materialize_private_instance(config, runtime_paths, requester_id)
     response_ctx = SimpleNamespace(
         result=SimpleNamespace(
             envelope=SimpleNamespace(room_id="!private:hs", requester_id=requester_id)
