@@ -1821,15 +1821,31 @@ async def test_message_hooks_offload_private_identity_discovery(
 ) -> None:
     """Private identity filesystem reads must not stall the runtime event loop."""
     module = _load_hooks_module()
-    settings = _settings()
+    requester_id = "@requester:hs"
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+    )
+    settings = _settings(["secret"])
+    envelope = SimpleNamespace(room_id="!room:hs", requester_id=requester_id)
+    common = {
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "settings": settings,
+        "logger": Mock(),
+        "is_active": lambda: True,
+    }
     ctx = (
-        _message_ctx(tmp_path, "!room:hs", settings)
+        SimpleNamespace(envelope=envelope, **common)
         if hook_name == "message"
-        else _after_response_ctx(tmp_path, "!room:hs", settings)
+        else SimpleNamespace(result=SimpleNamespace(envelope=envelope), **common)
     )
     original_discovery = module._private_instance_requesters_for_requester
+    discovery_started = threading.Event()
 
     def delayed_discovery(*args: object, **kwargs: object) -> object:
+        discovery_started.set()
         time.sleep(0.2)
         return original_discovery(*args, **kwargs)
 
@@ -1847,6 +1863,7 @@ async def test_message_hooks_offload_private_identity_discovery(
     heartbeat_delay = time.monotonic() - started
     await hook_task
 
+    assert discovery_started.is_set()
     assert heartbeat_delay < 0.1
 
 
