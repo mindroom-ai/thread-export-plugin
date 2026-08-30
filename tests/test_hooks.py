@@ -1710,6 +1710,59 @@ def test_private_identity_invalidation_and_repair_each_queue_full_reconciliation
     assert module._full_pass_pending is True
 
 
+@pytest.mark.asyncio
+async def test_identity_invalidated_during_full_pass_is_evicted_for_repair(
+    tmp_path: Path,
+) -> None:
+    """A full-pass invalidation must not leave an unchanged owner cached."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    requester_id = "@owner:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+    )
+    record_path = (
+        instance_roots[requester_id].parent / ".mindroom-private-instance.json"
+    )
+    valid_record = record_path.read_text(encoding="utf-8")
+    original_discovery = module._discover_private_instance_requesters
+
+    def invalidate_after_discovery(*args: object, **kwargs: object) -> object:
+        discovered = original_discovery(*args, **kwargs)
+        record_path.unlink()
+        return discovered
+
+    module._discover_private_instance_requesters = invalidate_after_discovery
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert module._private_instance_requesters == {}
+    assert module._full_pass_pending is True
+
+    module._full_pass_pending = False
+    record_path.write_text(valid_record, encoding="utf-8")
+    module._remember_private_instance_requester(
+        SimpleNamespace(
+            config=config,
+            runtime_paths=runtime_paths,
+            settings=env.settings,
+            logger=env.logger,
+            is_active=lambda: True,
+        ),
+        requester_id,
+    )
+
+    assert module._full_pass_pending is True
+
+
 def test_full_pass_queued_while_pending_work_drains_is_not_lost() -> None:
     """A worker-thread reconciliation request must survive a concurrent drain."""
     module = _load_hooks_module()

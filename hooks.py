@@ -550,7 +550,7 @@ def _private_agent_export_targets(
         cache_key = (agent_name, state_root)
         cached_owner = private_instance_requesters.get(cache_key)
         if owner is None or (not reconcile_instances and cached_owner != owner):
-            if not reconcile_instances and cached_owner is not None:
+            if cached_owner is not None:
                 _evict_private_instance_requester(cache_key, cached_owner)
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
