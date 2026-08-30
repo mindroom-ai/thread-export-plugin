@@ -72,18 +72,13 @@ _private_instance_requesters_lock = threading.Lock()
 _private_instance_requesters_revision = 0
 
 # Hot reload replaces this module but cannot interrupt a worker thread mid-pass, so the
-# single-flight lock and generation live on the long-lived core package. Every pass checks its
-# generation after acquiring the lock; an older module can never run after a newer reload.
+# single-flight lock and active token live on the long-lived core package. A module claims the
+# token only when a registered hook runs; staged imports leave the active module unchanged.
 _EXPORT_PASS_LOCK: threading.Lock = thread_export_pkg.__dict__.setdefault(
     "_thread_export_plugin_pass_lock",
     threading.Lock(),
 )
-_EXPORT_PASS_GENERATION: int = (
-    int(thread_export_pkg.__dict__.get("_thread_export_plugin_pass_generation", 0)) + 1
-)
-thread_export_pkg.__dict__["_thread_export_plugin_pass_generation"] = (
-    _EXPORT_PASS_GENERATION
-)
+_EXPORT_PASS_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -272,6 +267,13 @@ def _record_trigger(ctx: HookContext) -> None:
     _wakeup.set()
 
 
+def _activate_export_pass_token() -> None:
+    """Claim the long-lived pass token when this module receives a live hook."""
+    thread_export_pkg.__dict__["_thread_export_plugin_active_pass_token"] = (
+        _EXPORT_PASS_TOKEN
+    )
+
+
 def _drain_pending() -> tuple[bool, frozenset[str]]:
     """Atomically consume the pending full-pass flag and dirty room set."""
     global _full_pass_pending  # noqa: PLW0603
@@ -314,8 +316,8 @@ def _run_export_pass_blocking(
     """Run one export pass to completion on a private event loop in the calling thread."""
     with _EXPORT_PASS_LOCK:
         if (
-            thread_export_pkg.__dict__.get("_thread_export_plugin_pass_generation")
-            != _EXPORT_PASS_GENERATION
+            thread_export_pkg.__dict__.get("_thread_export_plugin_active_pass_token")
+            is not _EXPORT_PASS_TOKEN
         ):
             return
         asyncio.run(_run_export_pass(env, full_pass=full_pass, room_ids=room_ids))
@@ -671,6 +673,7 @@ async def _run_export_pass(
 async def queue_initial_full_pass(ctx: AgentLifecycleContext) -> None:
     """Queue one full export pass once the router bot is ready."""
     global _full_pass_pending  # noqa: PLW0603
+    _activate_export_pass_token()
     _prune_private_instance_requesters(ctx)
     _full_pass_pending = True
     _record_trigger(ctx)
@@ -680,6 +683,7 @@ async def queue_initial_full_pass(ctx: AgentLifecycleContext) -> None:
 async def queue_full_pass_after_config_reload(ctx: ConfigReloadedContext) -> None:
     """Queue a full pass after hot reload, including cleanup for removed agent settings."""
     global _full_pass_pending  # noqa: PLW0603
+    _activate_export_pass_token()
     _prune_private_instance_requesters(ctx)
     _full_pass_pending = True
     _record_trigger(ctx)
@@ -688,6 +692,7 @@ async def queue_full_pass_after_config_reload(ctx: ConfigReloadedContext) -> Non
 @hook(event="message:received", name="thread-export-on-message", timeout_ms=1000)
 async def queue_room_on_message(ctx: MessageReceivedContext) -> None:
     """Queue the message's room for re-export."""
+    _activate_export_pass_token()
     if not _requested_agents(ctx.settings):
         return
     _remember_private_instance_requester(ctx, ctx.envelope.requester_id)
@@ -700,6 +705,7 @@ async def queue_room_on_message(ctx: MessageReceivedContext) -> None:
 )
 async def queue_room_after_response(ctx: AfterResponseContext) -> None:
     """Queue the responded room for re-export."""
+    _activate_export_pass_token()
     if not _requested_agents(ctx.settings):
         return
     _remember_private_instance_requester(ctx, ctx.result.envelope.requester_id)

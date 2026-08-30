@@ -1060,6 +1060,7 @@ async def test_private_requester_observed_during_full_pass_survives_incremental_
     module.export_threads_to_targets_once = create_autospec(
         export_once, spec_set=True, side_effect=pause_full_pass
     )
+    module._activate_export_pass_token()
     pass_task = asyncio.create_task(
         asyncio.to_thread(
             module._run_export_pass_blocking,
@@ -1095,6 +1096,54 @@ async def test_private_requester_observed_during_full_pass_survives_incremental_
 
 
 @pytest.mark.asyncio
+async def test_discarded_staged_module_does_not_disable_active_worker_pass(
+    tmp_path: Path,
+) -> None:
+    """A staged import must not invalidate a module that remains in the live registry."""
+    active_module = _load_hooks_module()
+    active_export = active_module.export_threads_to_targets_once
+    _autospec_export(active_module, side_effect=_target_stats)
+    active_settings = {"agents": ["missing"], "debounce_seconds": 0}
+
+    await active_module.queue_full_pass_after_config_reload(
+        _lifecycle_ctx(tmp_path, active_settings)
+    )
+    await _drain(active_module)
+    await _shutdown_runner(active_module)
+
+    config, runtime_paths = _shared_runtime(tmp_path, ("code",))
+    export_dir = tmp_path / "agents" / "code" / "workspace" / "thread_exports"
+
+    async def write_active_export(
+        *, targets: tuple[object, ...], **_kwargs: object
+    ) -> tuple[Mock, ...]:
+        for target in targets:
+            target.output_dir.mkdir(parents=True, exist_ok=True)
+            (target.output_dir / "active.yaml").write_text("active", encoding="utf-8")
+        return _target_stats(targets=targets)
+
+    active_module.export_threads_to_targets_once = create_autospec(
+        active_export, spec_set=True, side_effect=write_active_export
+    )
+    _staged_module = _load_hooks_module()
+    active_env = active_module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["code"]},
+        logger=Mock(),
+    )
+
+    await asyncio.to_thread(
+        active_module._run_export_pass_blocking,
+        active_env,
+        full_pass=True,
+        room_ids=frozenset(),
+    )
+
+    assert (export_dir / "active.yaml").exists()
+
+
+@pytest.mark.asyncio
 async def test_reloaded_module_discards_cancelled_old_worker_pass(
     tmp_path: Path,
 ) -> None:
@@ -1121,17 +1170,22 @@ async def test_reloaded_module_discards_cancelled_old_worker_pass(
         old_export, spec_set=True, side_effect=recreate_exports
     )
     lock = old_module._EXPORT_PASS_LOCK
+    worker_started = threading.Event()
+    worker_completed = threading.Event()
+
+    def run_old_pass() -> None:
+        worker_started.set()
+        try:
+            old_module._run_export_pass_blocking(
+                old_env, full_pass=True, room_ids=frozenset()
+            )
+        finally:
+            worker_completed.set()
+
     lock.acquire()
-    old_pass = asyncio.create_task(
-        asyncio.to_thread(
-            old_module._run_export_pass_blocking,
-            old_env,
-            full_pass=True,
-            room_ids=frozenset(),
-        )
-    )
+    old_pass = asyncio.create_task(asyncio.to_thread(run_old_pass))
     try:
-        await asyncio.sleep(0.01)
+        await asyncio.to_thread(worker_started.wait)
         old_pass.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await old_pass
@@ -1148,10 +1202,19 @@ async def test_reloaded_module_discards_cancelled_old_worker_pass(
             logger=Mock(),
         )
 
+        await new_module.queue_full_pass_after_config_reload(
+            SimpleNamespace(
+                config=config,
+                runtime_paths=runtime_paths,
+                settings=new_env.settings,
+                logger=new_env.logger,
+            )
+        )
         await new_module._run_export_pass(new_env, full_pass=True, room_ids=frozenset())
         lock.release()
-        await asyncio.to_thread(lock.acquire)
-        lock.release()
+        await asyncio.to_thread(worker_completed.wait)
+        await _drain(new_module)
+        await _shutdown_runner(new_module)
 
         assert not export_dir.exists()
     finally:
