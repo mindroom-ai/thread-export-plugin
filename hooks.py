@@ -444,6 +444,7 @@ def _remove_export_tree(env: _TriggerEnv, output_dir: Path) -> None:
         clear_thread_export_root(
             output_dir,
             trusted_root=env.runtime_paths.storage_root,
+            should_clear=env.is_active,
         )
     except (OSError, RuntimeError):
         env.logger.warning(
