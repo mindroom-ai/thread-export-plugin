@@ -14,17 +14,15 @@ cancels tasks it finds in module globals or one level inside a global dict/list/
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import shutil
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
 import mindroom.thread_export as thread_export_pkg
 from mindroom.constants import ROUTER_AGENT_NAME
-from mindroom.durable_write import write_json_file_durable
 from mindroom.hooks import (
     AfterResponseContext,
     AgentLifecycleContext,
@@ -53,9 +51,6 @@ if TYPE_CHECKING:
 
 WORKSPACE_EXPORT_DIRNAME = "thread_exports"
 PRIVATE_INSTANCES_DIRNAME = "private_instances"
-PRIVATE_INSTANCE_OWNER_FILENAME = ".mindroom-thread-export-owner.json"
-PRIVATE_INSTANCE_OWNER_FORMAT = "mindroom-thread-export-owner"
-PRIVATE_INSTANCE_OWNER_VERSION = 1
 DEFAULT_DEBOUNCE_SECONDS = 2.0
 _MATRIX_USER_ID_PATTERN = re.compile(r"@[^:\s]+:\S+")
 
@@ -65,10 +60,6 @@ DEFAULT_PRIVATE_ROOM_SCOPE: PrivateRoomScope = "owner_and_agent"
 _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
 _observed_requester_ids: set[str] = set()
-_known_private_owners: dict[Path, str] = {}
-_persisted_owner_roots: set[Path] = set()
-_conflicting_owner_roots: set[Path] = set()
-_owner_state_generation = 0
 _full_pass_pending = False
 _wakeup: asyncio.Event | None = None
 _latest_env: _TriggerEnv | None = None
@@ -90,16 +81,6 @@ class _TriggerEnv:
     settings: Mapping[str, object]
     logger: BoundLogger
     requester_candidates: tuple[str, ...] = ()
-    conflicting_owner_roots: frozenset[Path] = frozenset()
-
-
-@dataclass(frozen=True)
-class _ExportPassResult:
-    """Owner state discovered by one worker-thread export pass."""
-
-    private_owners: tuple[tuple[Path, str], ...] = ()
-    persisted_owner_roots: tuple[Path, ...] = ()
-    conflicting_owner_roots: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,77 +139,27 @@ def _debounce_seconds(settings: Mapping[str, object]) -> float:
     return DEFAULT_DEBOUNCE_SECONDS
 
 
-def _enabled_private_instances(
-    ctx: HookContext,
-    requester_id: str,
-) -> tuple[tuple[Path, str, WorkerScope], ...]:
-    """Return this requester's existing enabled private instances and routing scopes."""
-    if _MATRIX_USER_ID_PATTERN.fullmatch(requester_id) is None:
-        return ()
-    instances: list[tuple[Path, str, WorkerScope]] = []
-    for agent_name in _requested_agents(ctx.settings):
-        agent_config = ctx.config.agents.get(agent_name)
-        if agent_config is None or agent_config.private is None:
-            continue
-        worker_scope = agent_config.private.per
-        state_root = private_instance_state_root_for_requester(
-            ctx.runtime_paths.storage_root,
-            requester_id=requester_id,
-            agent_name=agent_name,
-            worker_scope=worker_scope,
-            runtime_paths=ctx.runtime_paths,
-        )
-        if state_root is not None and state_root.is_dir():
-            instances.append((state_root, agent_name, worker_scope))
-    return tuple(instances)
-
-
-def _enabled_private_instance_roots(
-    ctx: HookContext,
-    requester_id: str,
-) -> tuple[Path, ...]:
-    """Return this requester's existing instances among the enabled private agents."""
-    return tuple(
-        state_root
-        for state_root, _agent_name, _worker_scope in _enabled_private_instances(
-            ctx, requester_id
-        )
-    )
-
-
 def _requester_has_enabled_private_instance(
     ctx: HookContext,
     requester_id: str,
 ) -> bool:
     """Return whether this requester owns an existing enabled private instance."""
-    return bool(_enabled_private_instance_roots(ctx, requester_id))
-
-
-def _persist_private_instance_owner(
-    state_root: Path,
-    requester_id: str,
-    logger: BoundLogger,
-) -> bool:
-    """Durably remember this state root's requester without blocking exports on I/O failure."""
-    try:
-        write_json_file_durable(
-            state_root / PRIVATE_INSTANCE_OWNER_FILENAME,
-            {
-                "format": PRIVATE_INSTANCE_OWNER_FORMAT,
-                "version": PRIVATE_INSTANCE_OWNER_VERSION,
-                "requester_id": requester_id,
-            },
-            sort_keys=True,
-            trailing_newline=True,
-        )
-    except OSError as exc:
-        logger.warning(
-            "Could not persist private instance owner",
-            instance_root=str(state_root),
-            error=str(exc),
-        )
+    if _MATRIX_USER_ID_PATTERN.fullmatch(requester_id) is None:
         return False
-    return True
+    for agent_name in _requested_agents(ctx.settings):
+        agent_config = ctx.config.agents.get(agent_name)
+        if agent_config is None or agent_config.private is None:
+            continue
+        state_root = private_instance_state_root_for_requester(
+            ctx.runtime_paths.storage_root,
+            requester_id=requester_id,
+            agent_name=agent_name,
+            worker_scope=agent_config.private.per,
+            runtime_paths=ctx.runtime_paths,
+        )
+        if state_root is not None and state_root.is_dir():
+            return True
+    return False
 
 
 def _remember_private_instance_requester(
@@ -236,40 +167,8 @@ def _remember_private_instance_requester(
     requester_id: str,
 ) -> None:
     """Retain one requester only while they own an enabled private instance."""
-    global _full_pass_pending, _owner_state_generation  # noqa: PLW0603
-    instances = _enabled_private_instances(ctx, requester_id)
-    if not instances:
-        return
-    for state_root, agent_name, worker_scope in instances:
-        resolved_root = state_root.resolve()
-        known_owner = _known_private_owners.get(resolved_root)
-        if known_owner is None:
-            known_owner = _persisted_private_instance_owner(
-                state_root,
-                agent_name=agent_name,
-                worker_scope=worker_scope,
-                runtime_paths=ctx.runtime_paths,
-            )
-            if known_owner is not None:
-                _known_private_owners[resolved_root] = known_owner
-                _persisted_owner_roots.add(resolved_root)
-                _owner_state_generation += 1
-        if known_owner is not None and known_owner != requester_id:
-            if resolved_root not in _conflicting_owner_roots:
-                _conflicting_owner_roots.add(resolved_root)
-                _owner_state_generation += 1
-            continue
-        if known_owner is None:
-            _known_private_owners[resolved_root] = requester_id
-            _owner_state_generation += 1
-        if resolved_root in _conflicting_owner_roots:
-            _full_pass_pending = True
-        if (
-            resolved_root not in _persisted_owner_roots
-            and _persist_private_instance_owner(state_root, requester_id, ctx.logger)
-        ):
-            _persisted_owner_roots.add(resolved_root)
-    _observed_requester_ids.add(requester_id)
+    if _requester_has_enabled_private_instance(ctx, requester_id):
+        _observed_requester_ids.add(requester_id)
 
 
 def _prune_private_instance_requesters(ctx: HookContext) -> None:
@@ -280,15 +179,6 @@ def _prune_private_instance_requesters(ctx: HookContext) -> None:
         if _requester_has_enabled_private_instance(ctx, requester_id)
     }
     _observed_requester_ids.intersection_update(retained)
-    retained_roots = {
-        state_root.resolve()
-        for requester_id in retained
-        for state_root in _enabled_private_instance_roots(ctx, requester_id)
-    }
-    for state_root in tuple(_known_private_owners):
-        if state_root not in retained_roots:
-            _known_private_owners.pop(state_root)
-    _persisted_owner_roots.intersection_update(retained_roots)
 
 
 def _record_trigger(ctx: HookContext) -> None:
@@ -300,7 +190,6 @@ def _record_trigger(ctx: HookContext) -> None:
         settings=ctx.settings,
         logger=ctx.logger,
         requester_candidates=tuple(_observed_requester_ids),
-        conflicting_owner_roots=frozenset(_conflicting_owner_roots),
     )
     if _wakeup is None:
         _wakeup = asyncio.Event()
@@ -324,7 +213,6 @@ def _drain_pending() -> tuple[bool, frozenset[str]]:
 
 async def _run_export_loop() -> None:
     """Drain export triggers one debounced single-flight pass at a time."""
-    global _full_pass_pending  # noqa: PLW0603
     while True:
         assert _wakeup is not None  # noqa: S101 - created before this task starts
         await _wakeup.wait()
@@ -338,42 +226,21 @@ async def _run_export_loop() -> None:
         full_pass, room_ids = _drain_pending()
         if not full_pass and not room_ids:
             continue
-        env = replace(
-            _latest_env or env,
-            requester_candidates=tuple(_observed_requester_ids),
-            conflicting_owner_roots=frozenset(_conflicting_owner_roots),
-        )
-        owner_state_generation = _owner_state_generation
+        env = _latest_env or env
         try:
-            pass_result = await asyncio.to_thread(
+            await asyncio.to_thread(
                 _run_export_pass_blocking, env, full_pass=full_pass, room_ids=room_ids
             )
         except Exception:
             env.logger.exception("Thread export pass crashed")
-        else:
-            if owner_state_generation != _owner_state_generation:
-                _full_pass_pending = True
-                assert _wakeup is not None  # noqa: S101 - runner owns this event
-                _wakeup.set()
-                continue
-            for state_root, owner in pass_result.private_owners:
-                _known_private_owners[state_root] = owner
-                _observed_requester_ids.add(owner)
-            if full_pass:
-                _persisted_owner_roots.clear()
-                _persisted_owner_roots.update(pass_result.persisted_owner_roots)
-                _conflicting_owner_roots.clear()
-                _conflicting_owner_roots.update(pass_result.conflicting_owner_roots)
 
 
 def _run_export_pass_blocking(
     env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
-) -> _ExportPassResult:
+) -> None:
     """Run one export pass to completion on a private event loop in the calling thread."""
     with _EXPORT_PASS_LOCK:
-        return asyncio.run(
-            _run_export_pass(env, full_pass=full_pass, room_ids=room_ids)
-        )
+        asyncio.run(_run_export_pass(env, full_pass=full_pass, room_ids=room_ids))
 
 
 def _private_instance_state_roots(
@@ -419,10 +286,9 @@ def _authorized_requester_candidates(config: Config) -> tuple[str, ...]:
 
 def _private_instance_owners(
     env: _TriggerEnv, agent_name: str, worker_scope: WorkerScope
-) -> tuple[dict[Path, str], set[Path]]:
-    """Map unambiguous private roots to owners and return colliding roots separately."""
+) -> dict[Path, str]:
+    """Map private-instance roots to statically configured or observed requesters."""
     owners: dict[Path, str] = {}
-    conflicting_roots: set[Path] = set()
     requester_candidates = dict.fromkeys(
         (*_authorized_requester_candidates(env.config), *env.requester_candidates)
     )
@@ -434,53 +300,9 @@ def _private_instance_owners(
             worker_scope=worker_scope,
             runtime_paths=env.runtime_paths,
         )
-        if candidate_root is None:
-            continue
-        resolved_root = candidate_root.resolve()
-        if resolved_root in conflicting_roots:
-            continue
-        current_owner = owners.get(resolved_root)
-        if current_owner is not None and current_owner != requester_id:
-            owners.pop(resolved_root)
-            conflicting_roots.add(resolved_root)
-            continue
-        owners[resolved_root] = requester_id
-    return owners, conflicting_roots
-
-
-def _persisted_private_instance_owner(
-    state_root: Path,
-    *,
-    agent_name: str,
-    worker_scope: WorkerScope,
-    runtime_paths: RuntimePaths,
-) -> str | None:
-    """Return a durable owner only when it resolves back to this private instance."""
-    marker_path = state_root / PRIVATE_INSTANCE_OWNER_FILENAME
-    try:
-        payload = json.loads(marker_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    requester_id = payload.get("requester_id")
-    if (
-        payload.get("format") != PRIVATE_INSTANCE_OWNER_FORMAT
-        or payload.get("version") != PRIVATE_INSTANCE_OWNER_VERSION
-        or not isinstance(requester_id, str)
-        or _MATRIX_USER_ID_PATTERN.fullmatch(requester_id) is None
-    ):
-        return None
-    candidate_root = private_instance_state_root_for_requester(
-        runtime_paths.storage_root,
-        requester_id=requester_id,
-        agent_name=agent_name,
-        worker_scope=worker_scope,
-        runtime_paths=runtime_paths,
-    )
-    if candidate_root is None or candidate_root.resolve() != state_root.resolve():
-        return None
-    return requester_id
+        if candidate_root is not None:
+            owners[candidate_root.resolve()] = requester_id
+    return owners
 
 
 def _remove_export_tree(output_dir: Path) -> None:
@@ -541,56 +363,15 @@ def _private_agent_export_targets(
     options: _AgentExportSettings,
     worker_scope: WorkerScope,
     reconcile_instances: bool,
-    recovered_private_owners: dict[Path, str],
-    persisted_owner_roots: set[Path],
-    conflicting_owner_roots: set[Path],
 ) -> tuple[ThreadExportTarget, ...]:
     """Return membership-scoped private targets, discovering orphans when requested."""
-    owners, candidate_conflicts = _private_instance_owners(
-        env, agent_name, worker_scope
-    )
-    conflicting_owner_roots.update(candidate_conflicts)
-    persisted_owners: dict[Path, str] = {}
+    owners = _private_instance_owners(env, agent_name, worker_scope)
     if reconcile_instances:
         state_roots = _private_instance_state_roots(
             env.runtime_paths.storage_root, agent_name
         )
-        for state_root in state_roots:
-            resolved_root = state_root.resolve()
-            if resolved_root in conflicting_owner_roots:
-                continue
-            owner = _persisted_private_instance_owner(
-                state_root,
-                agent_name=agent_name,
-                worker_scope=worker_scope,
-                runtime_paths=env.runtime_paths,
-            )
-            if owner is not None:
-                configured_owner = owners.get(resolved_root)
-                if configured_owner is not None and configured_owner != owner:
-                    owners.pop(resolved_root)
-                    conflicting_owner_roots.add(resolved_root)
-                    continue
-                persisted_owners[resolved_root] = owner
-                persisted_owner_roots.add(resolved_root)
-                owners[resolved_root] = owner
     else:
-        instance_dir_name = agent_state_root_path(
-            env.runtime_paths.storage_root, agent_name
-        ).name
-        incremental_roots = set(owners) | candidate_conflicts
-        incremental_roots.update(
-            root
-            for root in env.conflicting_owner_roots
-            if root.name == instance_dir_name
-        )
-        state_roots = tuple(sorted(root for root in incremental_roots if root.is_dir()))
-    if reconcile_instances:
-        for state_root in state_roots:
-            resolved_root = state_root.resolve()
-            owner = owners.get(resolved_root)
-            if owner is not None and resolved_root not in conflicting_owner_roots:
-                recovered_private_owners[resolved_root] = owner
+        state_roots = tuple(sorted(root for root in owners if root.is_dir()))
     if options.private_room_scope == "owner_and_agent" and agent_user_id is None:
         for state_root in state_roots:
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
@@ -602,23 +383,11 @@ def _private_agent_export_targets(
         )
         return ()
     targets: list[ThreadExportTarget] = []
-    active_conflicts = conflicting_owner_roots
-    if not reconcile_instances:
-        active_conflicts = active_conflicts | env.conflicting_owner_roots
     for state_root in state_roots:
         output_dir = _private_workspace_export_dir(env, agent_name, state_root)
         if output_dir is None:
             continue
-        resolved_root = state_root.resolve()
-        if resolved_root in active_conflicts:
-            _remove_export_tree(output_dir)
-            env.logger.warning(
-                "Skipping private instance with conflicting owners",
-                agent_name=agent_name,
-                instance_root=str(state_root),
-            )
-            continue
-        owner = owners.get(resolved_root)
+        owner = owners.get(state_root.resolve())
         if owner is None:
             _remove_export_tree(output_dir)
             env.logger.warning(
@@ -627,9 +396,6 @@ def _private_agent_export_targets(
                 instance_root=str(state_root),
             )
             continue
-        if reconcile_instances and persisted_owners.get(resolved_root) != owner:
-            if _persist_private_instance_owner(state_root, owner, env.logger):
-                persisted_owner_roots.add(resolved_root)
         required_member_user_ids = (owner,)
         if options.private_room_scope == "owner_and_agent":
             assert agent_user_id is not None
@@ -650,9 +416,6 @@ def _agent_export_targets(
     *,
     options: _AgentExportSettings,
     reconcile_private_instances: bool,
-    recovered_private_owners: dict[Path, str],
-    persisted_owner_roots: set[Path],
-    conflicting_owner_roots: set[Path],
 ) -> tuple[ThreadExportTarget, ...]:
     """Return shared or requester-private export targets for one configured agent."""
     agent_config = env.config.agents.get(agent_name)
@@ -677,9 +440,6 @@ def _agent_export_targets(
         options=options,
         worker_scope=agent_config.private.per,
         reconcile_instances=reconcile_private_instances,
-        recovered_private_owners=recovered_private_owners,
-        persisted_owner_roots=persisted_owner_roots,
-        conflicting_owner_roots=conflicting_owner_roots,
     )
 
 
@@ -706,11 +466,8 @@ def _cleanup_disabled_agent_exports(
 
 async def _run_export_pass(
     env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
-) -> _ExportPassResult:
+) -> None:
     """Export the dirty rooms (or everything) into every enabled agent's workspace."""
-    recovered_private_owners: dict[Path, str] = {}
-    persisted_owner_roots: set[Path] = set()
-    conflicting_owner_roots: set[Path] = set()
     requested = _requested_agents(env.settings)
     enabled = {
         name: options
@@ -735,9 +492,6 @@ async def _run_export_pass(
             agent_name,
             options=options,
             reconcile_private_instances=full_pass,
-            recovered_private_owners=recovered_private_owners,
-            persisted_owner_roots=persisted_owner_roots,
-            conflicting_owner_roots=conflicting_owner_roots,
         )
     ]
     targets = tuple(target for _, target, _ in target_records)
@@ -777,11 +531,6 @@ async def _run_export_pass(
                 threads_unchanged=stats.threads_unchanged,
                 failures=stats.failures,
             )
-    return _ExportPassResult(
-        private_owners=tuple(sorted(recovered_private_owners.items())),
-        persisted_owner_roots=tuple(sorted(persisted_owner_roots)),
-        conflicting_owner_roots=tuple(sorted(conflicting_owner_roots)),
-    )
 
 
 @hook(event="bot:ready", name="thread-export-startup", agents=(ROUTER_AGENT_NAME,))
