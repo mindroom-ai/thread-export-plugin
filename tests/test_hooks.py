@@ -1682,9 +1682,24 @@ def test_private_identity_invalidation_and_repair_each_queue_full_reconciliation
 
     module._remember_private_instance_requester(ctx, requester_id)
     module._full_pass_pending = False
+    cached_requesters, _revision = module._private_instance_requesters_snapshot()
     record_path.unlink()
-    module._remember_private_instance_requester(ctx, requester_id)
+    targets = module._private_agent_export_targets(
+        module._TriggerEnv(
+            config=config,
+            runtime_paths=runtime_paths,
+            settings=ctx.settings,
+            logger=ctx.logger,
+        ),
+        "secret",
+        agent_user_id="@mindroom_secret:localhost",
+        options=module._AgentExportSettings(),
+        worker_scope="user",
+        reconcile_instances=False,
+        private_instance_requesters=cached_requesters,
+    )
 
+    assert targets == ()
     assert module._private_instance_requesters == {}
     assert module._full_pass_pending is True
 

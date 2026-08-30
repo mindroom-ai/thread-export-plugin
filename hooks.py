@@ -389,6 +389,19 @@ def _private_instance_requesters_snapshot() -> tuple[dict[tuple[str, Path], str]
         return dict(_private_instance_requesters), _private_instance_requesters_revision
 
 
+def _evict_private_instance_requester(
+    cache_key: tuple[str, Path], expected_owner: str
+) -> None:
+    """Forget a still-stale cached root and reconcile every private export."""
+    global _private_instance_requesters_revision  # noqa: PLW0603
+    with _private_instance_requesters_lock:
+        if _private_instance_requesters.get(cache_key) != expected_owner:
+            return
+        del _private_instance_requesters[cache_key]
+        _private_instance_requesters_revision += 1
+    _queue_full_pass()
+
+
 def _discover_private_instance_requesters(
     env: _TriggerEnv, enabled_agent_names: set[str]
 ) -> dict[tuple[str, Path], str]:
@@ -533,10 +546,11 @@ def _private_agent_export_targets(
         return ()
     targets: list[ThreadExportTarget] = []
     for state_root, owner in state_root_owners:
-        if owner is None or (
-            not reconcile_instances
-            and private_instance_requesters.get((agent_name, state_root)) != owner
-        ):
+        cache_key = (agent_name, state_root)
+        cached_owner = private_instance_requesters.get(cache_key)
+        if owner is None or (not reconcile_instances and cached_owner != owner):
+            if not reconcile_instances and cached_owner is not None:
+                _evict_private_instance_requester(cache_key, cached_owner)
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
                 _remove_export_tree(env, output_dir)
