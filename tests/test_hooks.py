@@ -1491,3 +1491,9 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
     assert tuple(target.required_member_user_ids for target in targets) == (
         (requester_id,),
     )
+    assert (
+        module.export_threads_to_targets_once.await_args.kwargs["room_filter"] is None
+    )
+
+    module._remember_private_instance_requester(response_ctx, requester_id)
+    assert module._full_pass_pending is False

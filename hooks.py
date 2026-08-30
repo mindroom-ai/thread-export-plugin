@@ -218,7 +218,7 @@ def _remember_private_instance_requester(
     requester_id: str,
 ) -> None:
     """Remember core-authorized private roots observed by one hook."""
-    global _private_instance_requesters_revision  # noqa: PLW0603
+    global _full_pass_pending, _private_instance_requesters_revision  # noqa: PLW0603
     discovered = _private_instance_requesters_for_requester(ctx, requester_id)
     if not discovered:
         return
@@ -230,6 +230,7 @@ def _remember_private_instance_requester(
             return
         _private_instance_requesters.update(discovered)
         _private_instance_requesters_revision += 1
+        _full_pass_pending = True
 
 
 def _prune_private_instance_requesters(ctx: HookContext) -> None:
