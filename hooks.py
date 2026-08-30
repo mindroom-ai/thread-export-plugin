@@ -72,10 +72,17 @@ _private_instance_requesters_lock = threading.Lock()
 _private_instance_requesters_revision = 0
 
 # Hot reload replaces this module but cannot interrupt a worker thread mid-pass, so the
-# single-flight lock lives on the long-lived core package where every plugin copy finds it.
+# single-flight lock and generation live on the long-lived core package. Every pass checks its
+# generation after acquiring the lock; an older module can never run after a newer reload.
 _EXPORT_PASS_LOCK: threading.Lock = thread_export_pkg.__dict__.setdefault(
     "_thread_export_plugin_pass_lock",
     threading.Lock(),
+)
+_EXPORT_PASS_GENERATION: int = (
+    int(thread_export_pkg.__dict__.get("_thread_export_plugin_pass_generation", 0)) + 1
+)
+thread_export_pkg.__dict__["_thread_export_plugin_pass_generation"] = (
+    _EXPORT_PASS_GENERATION
 )
 
 
@@ -306,6 +313,11 @@ def _run_export_pass_blocking(
 ) -> None:
     """Run one export pass to completion on a private event loop in the calling thread."""
     with _EXPORT_PASS_LOCK:
+        if (
+            thread_export_pkg.__dict__.get("_thread_export_plugin_pass_generation")
+            != _EXPORT_PASS_GENERATION
+        ):
+            return
         asyncio.run(_run_export_pass(env, full_pass=full_pass, room_ids=room_ids))
 
 
@@ -314,7 +326,7 @@ def _private_instance_state_roots(
 ) -> tuple[Path, ...]:
     """Return existing private-instance state roots for one private agent."""
     instances_root = storage_root / PRIVATE_INSTANCES_DIRNAME
-    if not instances_root.is_dir():
+    if not instances_root.is_dir() or instances_root.is_symlink():
         return ()
     instance_dir_names = {
         agent_name,

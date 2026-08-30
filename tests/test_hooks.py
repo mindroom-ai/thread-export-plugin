@@ -165,6 +165,24 @@ def _symlinked_private_state_root(tmp_path: Path) -> Path:
     return external_export_dir
 
 
+def _symlinked_private_instances_root(tmp_path: Path) -> Path:
+    """Create an untrusted private-instances symlink and external export sentinel."""
+    external_instances_root = tmp_path / "external-instances"
+    external_export_dir = (
+        external_instances_root
+        / "untrusted"
+        / "secret"
+        / "secret_data"
+        / "thread_exports"
+    )
+    external_export_dir.mkdir(parents=True)
+    (external_export_dir / "sentinel.yaml").write_text("keep", encoding="utf-8")
+    (tmp_path / "private_instances").symlink_to(
+        external_instances_root, target_is_directory=True
+    )
+    return external_export_dir
+
+
 def _base_ctx(tmp_path: Path, settings: dict[str, object]) -> dict[str, object]:
     config, runtime_paths = _shared_runtime(tmp_path)
     return {
@@ -887,6 +905,52 @@ async def test_disabled_private_cleanup_ignores_symlinked_state_roots(
 
 
 @pytest.mark.asyncio
+async def test_full_pass_ignores_symlinked_private_instances_root(
+    tmp_path: Path,
+) -> None:
+    """Full reconciliation must not traverse a symlinked private-instances root."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path, (), persist_agent_identity=True
+    )
+    external_export_dir = _symlinked_private_instances_root(tmp_path)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert (external_export_dir / "sentinel.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_disabled_cleanup_ignores_symlinked_private_instances_root(
+    tmp_path: Path,
+) -> None:
+    """Disabled cleanup must not traverse a symlinked private-instances root."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path, (), persist_agent_identity=True
+    )
+    external_export_dir = _symlinked_private_instances_root(tmp_path)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": []},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert (external_export_dir / "sentinel.yaml").exists()
+
+
+@pytest.mark.asyncio
 async def test_missing_core_identity_removes_stale_private_exports(
     tmp_path: Path,
 ) -> None:
@@ -1028,6 +1092,71 @@ async def test_private_requester_observed_during_full_pass_survives_incremental_
     assert later_root / "secret_data" / "thread_exports" in {
         target.output_dir for target in targets
     }
+
+
+@pytest.mark.asyncio
+async def test_reloaded_module_discards_cancelled_old_worker_pass(
+    tmp_path: Path,
+) -> None:
+    """An old worker queued behind a reload must not recreate retracted exports."""
+    old_module = _load_hooks_module()
+    config, runtime_paths = _shared_runtime(tmp_path, ("code",))
+    old_env = old_module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["code"]},
+        logger=Mock(),
+    )
+    old_export = old_module.export_threads_to_targets_once
+
+    async def recreate_exports(
+        *, targets: tuple[object, ...], **_kwargs: object
+    ) -> tuple[Mock, ...]:
+        for target in targets:
+            target.output_dir.mkdir(parents=True, exist_ok=True)
+            (target.output_dir / "stale.yaml").write_text("old", encoding="utf-8")
+        return _target_stats(targets=targets)
+
+    old_module.export_threads_to_targets_once = create_autospec(
+        old_export, spec_set=True, side_effect=recreate_exports
+    )
+    lock = old_module._EXPORT_PASS_LOCK
+    lock.acquire()
+    old_pass = asyncio.create_task(
+        asyncio.to_thread(
+            old_module._run_export_pass_blocking,
+            old_env,
+            full_pass=True,
+            room_ids=frozenset(),
+        )
+    )
+    try:
+        await asyncio.sleep(0.01)
+        old_pass.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await old_pass
+
+        new_module = _load_hooks_module()
+        _autospec_export(new_module, side_effect=_target_stats)
+        export_dir = tmp_path / "agents" / "code" / "workspace" / "thread_exports"
+        export_dir.mkdir(parents=True)
+        (export_dir / "retracted.yaml").write_text("new", encoding="utf-8")
+        new_env = new_module._TriggerEnv(
+            config=config,
+            runtime_paths=runtime_paths,
+            settings={"agents": []},
+            logger=Mock(),
+        )
+
+        await new_module._run_export_pass(new_env, full_pass=True, room_ids=frozenset())
+        lock.release()
+        await asyncio.to_thread(lock.acquire)
+        lock.release()
+
+        assert not export_dir.exists()
+    finally:
+        if lock.locked():
+            lock.release()
 
 
 @pytest.mark.asyncio
