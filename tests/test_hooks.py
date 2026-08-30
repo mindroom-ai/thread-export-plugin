@@ -153,6 +153,18 @@ def _materialize_private_instance(
     ).state_root
 
 
+def _symlinked_private_state_root(tmp_path: Path) -> Path:
+    """Create an untrusted private-root symlink and an external export sentinel."""
+    external_state_root = tmp_path / "external" / "secret"
+    external_export_dir = external_state_root / "secret_data" / "thread_exports"
+    external_export_dir.mkdir(parents=True)
+    (external_export_dir / "sentinel.yaml").write_text("keep", encoding="utf-8")
+    symlink_root = tmp_path / "private_instances" / "untrusted" / "secret"
+    symlink_root.parent.mkdir(parents=True)
+    symlink_root.symlink_to(external_state_root, target_is_directory=True)
+    return external_export_dir
+
+
 def _base_ctx(tmp_path: Path, settings: dict[str, object]) -> dict[str, object]:
     config, runtime_paths = _shared_runtime(tmp_path)
     return {
@@ -826,6 +838,52 @@ async def test_private_exports_do_not_create_private_owner_metadata(
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
     assert {entry.name for entry in instance_root.parent.iterdir()} == scope_entries
+
+
+@pytest.mark.asyncio
+async def test_invalid_symlinked_private_root_does_not_remove_external_exports(
+    tmp_path: Path,
+) -> None:
+    """An invalid private-root symlink must not delete exports outside its scope."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path, (), persist_agent_identity=True
+    )
+    external_export_dir = _symlinked_private_state_root(tmp_path)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert (external_export_dir / "sentinel.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_disabled_private_cleanup_ignores_symlinked_state_roots(
+    tmp_path: Path,
+) -> None:
+    """Disabled-agent cleanup must not follow untrusted private-root symlinks."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path, (), persist_agent_identity=True
+    )
+    external_export_dir = _symlinked_private_state_root(tmp_path)
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": []},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert (external_export_dir / "sentinel.yaml").exists()
 
 
 @pytest.mark.asyncio

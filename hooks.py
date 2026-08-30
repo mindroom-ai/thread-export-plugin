@@ -198,7 +198,7 @@ def _private_instance_requesters_for_requester(
             worker_scope=agent_config.private.per,
             runtime_paths=ctx.runtime_paths,
         )
-        if state_root is None or not state_root.is_dir():
+        if state_root is None or not state_root.is_dir() or state_root.is_symlink():
             continue
         resolved_root = state_root.resolve()
         if (
@@ -324,9 +324,13 @@ def _private_instance_state_roots(
         sorted(
             state_root
             for scope_dir in instances_root.iterdir()
-            if scope_dir.is_dir()
+            if scope_dir.is_dir() and not scope_dir.is_symlink()
             for state_root in scope_dir.iterdir()
-            if state_root.is_dir() and state_root.name in instance_dir_names
+            if (
+                state_root.is_dir()
+                and not state_root.is_symlink()
+                and state_root.name in instance_dir_names
+            )
         ),
     )
 
@@ -447,10 +451,23 @@ def _private_agent_export_targets(
         )
     else:
         state_roots = tuple(
-            sorted(root for root in private_instance_requesters if root.is_dir())
+            sorted(
+                root
+                for root in private_instance_requesters
+                if root.is_dir() and not root.is_symlink()
+            )
         )
+    state_root_owners = tuple(
+        (
+            state_root,
+            _private_instance_requester(
+                env, agent_name, worker_scope, state_root.resolve()
+            ),
+        )
+        for state_root in state_roots
+    )
     if options.private_room_scope == "owner_and_agent" and agent_user_id is None:
-        for state_root in state_roots:
+        for state_root, _owner in state_root_owners:
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
                 _remove_export_tree(output_dir)
@@ -460,23 +477,22 @@ def _private_agent_export_targets(
         )
         return ()
     targets: list[ThreadExportTarget] = []
-    for state_root in state_roots:
-        output_dir = _private_workspace_export_dir(env, agent_name, state_root)
-        if output_dir is None:
-            continue
-        owner = _private_instance_requester(
-            env, agent_name, worker_scope, state_root.resolve()
-        )
+    for state_root, owner in state_root_owners:
         if owner is None or (
             not reconcile_instances
             and private_instance_requesters.get(state_root.resolve()) != owner
         ):
-            _remove_export_tree(output_dir)
+            output_dir = _private_workspace_export_dir(env, agent_name, state_root)
+            if output_dir is not None:
+                _remove_export_tree(output_dir)
             env.logger.warning(
                 "Skipping private instance without valid core identity",
                 agent_name=agent_name,
                 instance_root=str(state_root),
             )
+            continue
+        output_dir = _private_workspace_export_dir(env, agent_name, state_root)
+        if output_dir is None:
             continue
         required_member_user_ids = (owner,)
         if options.private_room_scope == "owner_and_agent":
@@ -543,6 +559,13 @@ def _cleanup_disabled_agent_exports(
         for state_root in _private_instance_state_roots(
             env.runtime_paths.storage_root, agent_name
         ):
+            if (
+                _private_instance_requester(
+                    env, agent_name, agent_config.private.per, state_root.resolve()
+                )
+                is None
+            ):
+                continue
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
                 _remove_export_tree(output_dir)
