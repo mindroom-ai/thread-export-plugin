@@ -905,6 +905,67 @@ async def test_disabled_private_cleanup_ignores_symlinked_state_roots(
 
 
 @pytest.mark.asyncio
+async def test_disabled_private_cleanup_removes_recordless_legacy_exports(
+    tmp_path: Path,
+) -> None:
+    """Disabled cleanup removes plugin exports from regular legacy state roots."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path, (), persist_agent_identity=True
+    )
+    export_dir = (
+        tmp_path
+        / "private_instances"
+        / "legacy"
+        / "secret"
+        / "secret_data"
+        / "thread_exports"
+    )
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("old", encoding="utf-8")
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": []},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert not export_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_disabled_private_cleanup_ignores_workspace_validation_errors(
+    tmp_path: Path,
+) -> None:
+    """Disabled cleanup leaves a target alone when its workspace path is invalid."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    requester_id = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path, (requester_id,), persist_agent_identity=True
+    )
+    export_dir = instance_roots[requester_id] / "secret_data" / "thread_exports"
+    export_dir.mkdir(parents=True)
+    (export_dir / "old.yaml").write_text("old", encoding="utf-8")
+    module.resolve_agent_workspace_from_state_path = Mock(
+        side_effect=ValueError("invalid workspace path")
+    )
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": []},
+        logger=Mock(),
+    )
+
+    await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
+
+    assert (export_dir / "old.yaml").exists()
+
+
+@pytest.mark.asyncio
 async def test_full_pass_ignores_symlinked_private_instances_root(
     tmp_path: Path,
 ) -> None:

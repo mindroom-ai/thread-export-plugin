@@ -410,13 +410,16 @@ def _private_workspace_export_dir(
     env: _TriggerEnv, agent_name: str, state_root: Path
 ) -> Path | None:
     """Resolve one private instance's plugin-owned export directory."""
-    workspace = resolve_agent_workspace_from_state_path(
-        agent_name,
-        env.config,
-        runtime_paths=env.runtime_paths,
-        state_storage_path=state_root,
-        use_state_storage_path=True,
-    )
+    try:
+        workspace = resolve_agent_workspace_from_state_path(
+            agent_name,
+            env.config,
+            runtime_paths=env.runtime_paths,
+            state_storage_path=state_root,
+            use_state_storage_path=True,
+        )
+    except ValueError:
+        return None
     return workspace.root / WORKSPACE_EXPORT_DIRNAME if workspace is not None else None
 
 
@@ -573,13 +576,6 @@ def _cleanup_disabled_agent_exports(
         for state_root in _private_instance_state_roots(
             env.runtime_paths.storage_root, agent_name
         ):
-            if (
-                _private_instance_requester(
-                    env, agent_name, agent_config.private.per, state_root.resolve()
-                )
-                is None
-            ):
-                continue
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
                 _remove_export_tree(output_dir)
