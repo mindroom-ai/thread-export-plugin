@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import sys
 import threading
+import time
 from importlib import util
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +25,13 @@ from mindroom.hooks.decorators import get_hook_metadata
 from mindroom.matrix.identity import managed_account_key
 from mindroom.matrix.state import MatrixState
 from mindroom.runtime_resolution import resolve_agent_runtime
+from mindroom.thread_export.models import ThreadExportRoom
+from mindroom.thread_export.storage import (
+    _ROOT_MARKER_FILENAME,
+    _ROOT_MARKER_TEXT,
+    write_room_index,
+    write_thread_payload,
+)
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
 )
@@ -165,6 +174,41 @@ def _symlinked_private_state_root(tmp_path: Path) -> Path:
     return external_export_dir
 
 
+def _write_owned_export(output_dir: Path) -> None:
+    """Create one marker-backed export tree owned by the core exporter."""
+    room = ThreadExportRoom(
+        key="lobby",
+        room_id="!lobby:hs",
+        alias="#lobby:hs",
+        name="Lobby",
+    )
+    write_thread_payload(
+        output_dir,
+        room,
+        "$thread:hs",
+        {
+            "version": 1,
+            "room": {
+                "key": room.key,
+                "id": room.room_id,
+                "alias": room.alias,
+                "name": room.name,
+            },
+            "thread": {"id": "$thread:hs", "source": "matrix"},
+            "messages": [],
+        },
+    )
+    write_room_index(output_dir, room)
+
+
+def _assert_export_retracted(output_dir: Path) -> None:
+    """Assert that only the core ownership marker remains after retraction."""
+    assert tuple(path.name for path in output_dir.iterdir()) == (_ROOT_MARKER_FILENAME,)
+    assert (output_dir / _ROOT_MARKER_FILENAME).read_text(
+        encoding="utf-8"
+    ) == _ROOT_MARKER_TEXT
+
+
 def _symlinked_private_instances_root(tmp_path: Path) -> Path:
     """Create an untrusted private-instances symlink and external export sentinel."""
     external_instances_root = tmp_path / "external-instances"
@@ -190,6 +234,7 @@ def _base_ctx(tmp_path: Path, settings: dict[str, object]) -> dict[str, object]:
         "config": config,
         "runtime_paths": runtime_paths,
         "logger": Mock(),
+        "is_active": lambda: True,
     }
 
 
@@ -328,6 +373,7 @@ async def test_config_reload_queues_full_pass(tmp_path: Path) -> None:
 async def test_message_triggers_coalesce_into_one_pass(tmp_path: Path) -> None:
     """Repeated triggers should coalesce into one shared export per dirty room."""
     module = _load_hooks_module()
+    module._live_hook_seen = True
     _autospec_export(module, side_effect=_target_stats)
     settings = _settings()
 
@@ -496,6 +542,7 @@ async def test_bot_ready_runs_full_pass(tmp_path: Path) -> None:
 async def test_full_pass_subsumes_pending_rooms(tmp_path: Path) -> None:
     """A pending full pass should replace per-room exports in the same drain."""
     module = _load_hooks_module()
+    module._live_hook_seen = True
     _autospec_export(module, side_effect=_target_stats)
     settings = _settings()
 
@@ -514,6 +561,7 @@ async def test_full_pass_subsumes_pending_rooms(tmp_path: Path) -> None:
 async def test_mid_pass_triggers_drain_in_one_followup(tmp_path: Path) -> None:
     """Triggers arriving during a pass should coalesce into exactly one follow-up pass."""
     module = _load_hooks_module()
+    module._live_hook_seen = True
     release = threading.Event()
     started = threading.Event()
 
@@ -622,8 +670,7 @@ async def test_full_pass_removes_exports_for_disabled_agents(tmp_path: Path) -> 
     research_export_dir = (
         tmp_path / "agents" / "research" / "workspace" / "thread_exports"
     )
-    research_export_dir.mkdir(parents=True)
-    (research_export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    _write_owned_export(research_export_dir)
     config, runtime_paths = _shared_runtime(tmp_path)
     env = module._TriggerEnv(
         config=config,
@@ -634,7 +681,7 @@ async def test_full_pass_removes_exports_for_disabled_agents(tmp_path: Path) -> 
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
-    assert not research_export_dir.exists()
+    _assert_export_retracted(research_export_dir)
     targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
     assert [target.output_dir.parts[-3] for target in targets] == ["code"]
 
@@ -647,8 +694,7 @@ async def test_shared_agent_without_persisted_identity_fails_closed(
     module = _load_hooks_module()
     _autospec_export(module, side_effect=_target_stats)
     export_dir = tmp_path / "agents" / "code" / "workspace" / "thread_exports"
-    export_dir.mkdir(parents=True)
-    (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    _write_owned_export(export_dir)
     config, runtime_paths = _shared_runtime(
         tmp_path,
         ("code",),
@@ -664,7 +710,7 @@ async def test_shared_agent_without_persisted_identity_fails_closed(
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
-    assert not export_dir.exists()
+    _assert_export_retracted(export_dir)
     assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
     logger.warning.assert_called_once_with(
         "Skipping shared agent without persisted Matrix account",
@@ -685,8 +731,7 @@ async def test_private_agent_without_persisted_identity_fails_closed(
         persist_agent_identity=False,
     )
     export_dir = instance_roots["@alice:hs"] / "secret_data" / "thread_exports"
-    export_dir.mkdir(parents=True)
-    (export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    _write_owned_export(export_dir)
     logger = Mock()
     env = module._TriggerEnv(
         config=config,
@@ -697,7 +742,7 @@ async def test_private_agent_without_persisted_identity_fails_closed(
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
-    assert not export_dir.exists()
+    _assert_export_retracted(export_dir)
     assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
     logger.warning.assert_called_once_with(
         "Skipping private agent without persisted Matrix account",
@@ -770,8 +815,7 @@ async def test_private_agent_exports_require_owner_and_agent_membership_by_defau
     }
     ghost_root = tmp_path / "private_instances" / "ghost-0000000000000000" / "secret"
     ghost_export_dir = ghost_root / "secret_data" / "thread_exports"
-    ghost_export_dir.mkdir(parents=True)
-    (ghost_export_dir / "old.yaml").write_text("secret", encoding="utf-8")
+    _write_owned_export(ghost_export_dir)
     logger = Mock()
     env = module._TriggerEnv(
         config=config,
@@ -791,7 +835,7 @@ async def test_private_agent_exports_require_owner_and_agent_membership_by_defau
         (owner, "@mindroom_secret:localhost"): output_dir
         for owner, output_dir in expected_dirs.items()
     }
-    assert not ghost_export_dir.exists()
+    _assert_export_retracted(ghost_export_dir)
     orphan_warnings = [
         call
         for call in logger.warning.call_args_list
@@ -799,6 +843,51 @@ async def test_private_agent_exports_require_owner_and_agent_membership_by_defau
     ]
     assert len(orphan_warnings) == 1
     assert "ghost-0000000000000000" in orphan_warnings[0].kwargs["instance_root"]
+
+
+def test_private_workspace_swap_keeps_lexical_export_target(tmp_path: Path) -> None:
+    """A post-validation symlink swap cannot redirect an in-root export target."""
+    module = _load_hooks_module()
+    requester_id = "@alice:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+    )
+    state_root = instance_roots[requester_id]
+    saved_state_root = state_root.with_name("secret-saved")
+    victim_root = tmp_path / "victim"
+    victim_root.mkdir()
+    original_resolver = module.resolve_agent_workspace_from_state_path
+
+    def swap_then_resolve(*args: object, **kwargs: object) -> object:
+        state_root.rename(saved_state_root)
+        state_root.symlink_to(victim_root, target_is_directory=True)
+        return original_resolver(*args, **kwargs)
+
+    module.resolve_agent_workspace_from_state_path = swap_then_resolve
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+    )
+
+    targets = module._private_agent_export_targets(
+        env,
+        "secret",
+        agent_user_id="@mindroom_secret:localhost",
+        options=module._AgentExportSettings(
+            invited_rooms=True,
+            private_room_scope="owner_and_agent",
+        ),
+        worker_scope="user",
+        reconcile_instances=True,
+        private_instance_requesters={},
+    )
+
+    assert targets[0].output_dir == state_root / "secret_data" / "thread_exports"
+    assert targets[0].output_dir != victim_root / "secret_data" / "thread_exports"
 
 
 @pytest.mark.asyncio
@@ -922,8 +1011,7 @@ async def test_disabled_private_cleanup_removes_recordless_legacy_exports(
         / "secret_data"
         / "thread_exports"
     )
-    export_dir.mkdir(parents=True)
-    (export_dir / "old.yaml").write_text("old", encoding="utf-8")
+    _write_owned_export(export_dir)
     env = module._TriggerEnv(
         config=config,
         runtime_paths=runtime_paths,
@@ -933,7 +1021,7 @@ async def test_disabled_private_cleanup_removes_recordless_legacy_exports(
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
-    assert not export_dir.exists()
+    _assert_export_retracted(export_dir)
 
 
 @pytest.mark.asyncio
@@ -948,8 +1036,7 @@ async def test_disabled_private_cleanup_ignores_workspace_validation_errors(
         tmp_path, (requester_id,), persist_agent_identity=True
     )
     export_dir = instance_roots[requester_id] / "secret_data" / "thread_exports"
-    export_dir.mkdir(parents=True)
-    (export_dir / "old.yaml").write_text("old", encoding="utf-8")
+    _write_owned_export(export_dir)
     module.resolve_agent_workspace_from_state_path = Mock(
         side_effect=ValueError("invalid workspace path")
     )
@@ -962,7 +1049,7 @@ async def test_disabled_private_cleanup_ignores_workspace_validation_errors(
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
-    assert (export_dir / "old.yaml").exists()
+    assert export_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -1024,8 +1111,7 @@ async def test_missing_core_identity_removes_stale_private_exports(
     )
     instance_root = instance_roots[requester_id]
     export_dir = instance_root / "secret_data" / "thread_exports"
-    export_dir.mkdir(parents=True)
-    (export_dir / "old.yaml").write_text("old", encoding="utf-8")
+    _write_owned_export(export_dir)
     (instance_root.parent / ".mindroom-private-instance.json").unlink()
     env = module._TriggerEnv(
         config=config,
@@ -1036,7 +1122,7 @@ async def test_missing_core_identity_removes_stale_private_exports(
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
-    assert not export_dir.exists()
+    _assert_export_retracted(export_dir)
     assert module.export_threads_to_targets_once.await_args.kwargs["targets"] == ()
 
 
@@ -1054,8 +1140,7 @@ async def test_invalid_core_identity_removes_stale_private_exports(
     )
     instance_root = instance_roots[requester_id]
     export_dir = instance_root / "secret_data" / "thread_exports"
-    export_dir.mkdir(parents=True)
-    (export_dir / "old.yaml").write_text("old", encoding="utf-8")
+    _write_owned_export(export_dir)
     record_path = instance_root.parent / ".mindroom-private-instance.json"
     if invalid_record == "mismatched":
         record_path.write_text(
@@ -1075,7 +1160,7 @@ async def test_invalid_core_identity_removes_stale_private_exports(
 
     await module._run_export_pass(env, full_pass=True, room_ids=frozenset())
 
-    assert not export_dir.exists()
+    _assert_export_retracted(export_dir)
     assert tuple(
         target.required_member_user_ids
         for target in module.export_threads_to_targets_once.await_args.kwargs["targets"]
@@ -1121,7 +1206,6 @@ async def test_private_requester_observed_during_full_pass_survives_incremental_
     module.export_threads_to_targets_once = create_autospec(
         export_once, spec_set=True, side_effect=pause_full_pass
     )
-    module._activate_export_pass_token()
     pass_task = asyncio.create_task(
         asyncio.to_thread(
             module._run_export_pass_blocking,
@@ -1137,6 +1221,7 @@ async def test_private_requester_observed_during_full_pass_survives_incremental_
             runtime_paths=runtime_paths,
             settings=env.settings,
             logger=env.logger,
+            is_active=lambda: True,
         ),
         later_requester_id,
     )
@@ -1211,11 +1296,13 @@ async def test_reloaded_module_discards_cancelled_old_worker_pass(
     """An old worker queued behind a reload must not recreate retracted exports."""
     old_module = _load_hooks_module()
     config, runtime_paths = _shared_runtime(tmp_path, ("code",))
+    old_active = True
     old_env = old_module._TriggerEnv(
         config=config,
         runtime_paths=runtime_paths,
         settings={"agents": ["code"]},
         logger=Mock(),
+        is_active=lambda: old_active,
     )
     old_export = old_module.export_threads_to_targets_once
 
@@ -1252,10 +1339,10 @@ async def test_reloaded_module_discards_cancelled_old_worker_pass(
             await old_pass
 
         new_module = _load_hooks_module()
+        old_active = False
         _autospec_export(new_module, side_effect=_target_stats)
         export_dir = tmp_path / "agents" / "code" / "workspace" / "thread_exports"
-        export_dir.mkdir(parents=True)
-        (export_dir / "retracted.yaml").write_text("new", encoding="utf-8")
+        _write_owned_export(export_dir)
         new_env = new_module._TriggerEnv(
             config=config,
             runtime_paths=runtime_paths,
@@ -1269,6 +1356,7 @@ async def test_reloaded_module_discards_cancelled_old_worker_pass(
                 runtime_paths=runtime_paths,
                 settings=new_env.settings,
                 logger=new_env.logger,
+                is_active=lambda: True,
             )
         )
         await new_module._run_export_pass(new_env, full_pass=True, room_ids=frozenset())
@@ -1277,7 +1365,7 @@ async def test_reloaded_module_discards_cancelled_old_worker_pass(
         await _drain(new_module)
         await _shutdown_runner(new_module)
 
-        assert not export_dir.exists()
+        _assert_export_retracted(export_dir)
     finally:
         if lock.locked():
             lock.release()
@@ -1312,6 +1400,7 @@ async def test_incremental_pass_ignores_unresolved_private_instances(
             runtime_paths=runtime_paths,
             settings=env.settings,
             logger=logger,
+            is_active=lambda: True,
         ),
         "@alice:hs",
     )
@@ -1377,6 +1466,7 @@ async def test_incremental_private_exports_ignore_other_agent_roots(
             runtime_paths=runtime_paths,
             settings={"agents": ["alpha", "beta"]},
             logger=logger,
+            is_active=lambda: True,
         ),
         requester_id,
     )
@@ -1456,6 +1546,7 @@ async def test_message_requester_resolves_unlisted_private_owner(
         config=config,
         runtime_paths=runtime_paths,
         logger=Mock(),
+        is_active=lambda: True,
     )
 
     await module.queue_room_on_message(ctx)
@@ -1494,6 +1585,7 @@ async def test_message_requester_without_private_instance_is_not_retained(
         config=config,
         runtime_paths=runtime_paths,
         logger=Mock(),
+        is_active=lambda: True,
     )
 
     await module.queue_room_on_message(ctx)
@@ -1531,6 +1623,7 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
         config=config,
         runtime_paths=runtime_paths,
         logger=Mock(),
+        is_active=lambda: True,
     )
 
     await module.queue_room_on_message(message_ctx)
@@ -1545,6 +1638,7 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
         config=config,
         runtime_paths=runtime_paths,
         logger=Mock(),
+        is_active=lambda: True,
     )
 
     await module.queue_room_after_response(response_ctx)
@@ -1561,3 +1655,215 @@ async def test_after_response_resolves_new_private_instance(tmp_path: Path) -> N
 
     module._remember_private_instance_requester(response_ctx, requester_id)
     assert module._full_pass_pending is False
+
+
+def test_private_identity_invalidation_and_repair_each_queue_full_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Removing and restoring the same identity cannot strand non-triggering rooms."""
+    module = _load_hooks_module()
+    requester_id = "@owner:hs"
+    config, runtime_paths, instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+    )
+    ctx = SimpleNamespace(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": ["secret"]},
+        logger=Mock(),
+        is_active=lambda: True,
+    )
+    record_path = (
+        instance_roots[requester_id].parent / ".mindroom-private-instance.json"
+    )
+    valid_record = record_path.read_text(encoding="utf-8")
+
+    module._remember_private_instance_requester(ctx, requester_id)
+    module._full_pass_pending = False
+    record_path.unlink()
+    module._remember_private_instance_requester(ctx, requester_id)
+
+    assert module._private_instance_requesters == {}
+    assert module._full_pass_pending is True
+
+    module._full_pass_pending = False
+    record_path.write_text(valid_record, encoding="utf-8")
+    module._remember_private_instance_requester(ctx, requester_id)
+
+    assert module._full_pass_pending is True
+
+
+def test_full_pass_queued_while_pending_work_drains_is_not_lost() -> None:
+    """A worker-thread reconciliation request must survive a concurrent drain."""
+    module = _load_hooks_module()
+    source_lines, first_line = inspect.getsourcelines(module._drain_pending)
+    reset_line = first_line + next(
+        index
+        for index, line in enumerate(source_lines)
+        if line.strip() == "_full_pass_pending = False"
+    )
+    drain_paused = threading.Event()
+    resume_drain = threading.Event()
+    queue_finished = threading.Event()
+
+    def pause_before_reset(frame: object, event: str, _arg: object) -> object:
+        if (
+            event == "line"
+            and getattr(frame, "f_code", None) is module._drain_pending.__code__
+            and getattr(frame, "f_lineno", None) == reset_line
+        ):
+            drain_paused.set()
+            assert resume_drain.wait(1)
+        return pause_before_reset
+
+    def drain() -> None:
+        sys.settrace(pause_before_reset)
+        try:
+            module._drain_pending()
+        finally:
+            sys.settrace(None)
+
+    def queue() -> None:
+        module._queue_full_pass()
+        queue_finished.set()
+
+    drain_thread = threading.Thread(target=drain)
+    queue_thread = threading.Thread(target=queue)
+    drain_thread.start()
+    assert drain_paused.wait(1)
+    try:
+        queue_thread.start()
+        assert not queue_finished.wait(0.05)
+    finally:
+        resume_drain.set()
+        drain_thread.join(1)
+        queue_thread.join(1)
+
+    assert queue_finished.is_set()
+    assert module._full_pass_pending is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_name", ["message", "after_response"])
+async def test_message_hooks_offload_private_identity_discovery(
+    tmp_path: Path,
+    hook_name: str,
+) -> None:
+    """Private identity filesystem reads must not stall the runtime event loop."""
+    module = _load_hooks_module()
+    settings = _settings()
+    ctx = (
+        _message_ctx(tmp_path, "!room:hs", settings)
+        if hook_name == "message"
+        else _after_response_ctx(tmp_path, "!room:hs", settings)
+    )
+    original_discovery = module._private_instance_requesters_for_requester
+
+    def delayed_discovery(*args: object, **kwargs: object) -> object:
+        time.sleep(0.2)
+        return original_discovery(*args, **kwargs)
+
+    module._private_instance_requesters_for_requester = delayed_discovery
+    module._record_trigger = Mock()
+    hook = (
+        module.queue_room_on_message
+        if hook_name == "message"
+        else module.queue_room_after_response
+    )
+    started = time.monotonic()
+    hook_task = asyncio.create_task(hook(ctx))
+
+    await asyncio.sleep(0.02)
+    heartbeat_delay = time.monotonic() - started
+    await hook_task
+
+    assert heartbeat_delay < 0.1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_name", ["message", "after_response"])
+async def test_slow_private_discovery_cannot_lose_trigger(
+    tmp_path: Path,
+    hook_name: str,
+) -> None:
+    """A timed-out discovery still leaves queued room and reconciliation work."""
+    module = _load_hooks_module()
+    requester_id = "@requester:hs"
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+    )
+    settings = _settings(["secret"])
+    common = {
+        "config": config,
+        "runtime_paths": runtime_paths,
+        "settings": settings,
+        "logger": Mock(),
+        "is_active": lambda: True,
+    }
+    envelope = SimpleNamespace(room_id="!room:hs", requester_id=requester_id)
+    ctx = (
+        SimpleNamespace(envelope=envelope, **common)
+        if hook_name == "message"
+        else SimpleNamespace(result=SimpleNamespace(envelope=envelope), **common)
+    )
+    original_discovery = module._private_instance_requesters_for_requester
+    discovery_finished = threading.Event()
+
+    def delayed_discovery(*args: object, **kwargs: object) -> object:
+        time.sleep(0.2)
+        result = original_discovery(*args, **kwargs)
+        discovery_finished.set()
+        return result
+
+    module._private_instance_requesters_for_requester = delayed_discovery
+    module._record_trigger = Mock()
+    module._queue_full_pass = Mock(wraps=module._queue_full_pass)
+    module._live_hook_seen = True
+    hook = (
+        module.queue_room_on_message
+        if hook_name == "message"
+        else module.queue_room_after_response
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(hook(ctx), timeout=0.05)
+
+    assert module._pending_room_ids == {"!room:hs"}
+    module._record_trigger.assert_called_once_with(ctx)
+    assert await asyncio.to_thread(discovery_finished.wait, 1)
+    module._queue_full_pass.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_first_live_hook_after_source_reload_queues_full_pass(
+    tmp_path: Path,
+) -> None:
+    """The first hook from a newly published module reconciles all export state."""
+    module = _load_hooks_module()
+    module._record_trigger = Mock()
+
+    await module.queue_room_on_message(
+        _message_ctx(tmp_path, "!changed:hs", _settings())
+    )
+
+    assert module._full_pass_pending is True
+    assert module._pending_room_ids == {"!changed:hs"}
+
+
+@pytest.mark.asyncio
+async def test_stale_hook_after_source_reload_cannot_queue_work(tmp_path: Path) -> None:
+    """A callback from a superseded registry cannot reactivate its old module."""
+    module = _load_hooks_module()
+    module._record_trigger = Mock()
+    ctx = _message_ctx(tmp_path, "!changed:hs", _settings())
+    ctx.is_active = lambda: False
+
+    await module.queue_room_on_message(ctx)
+
+    assert module._full_pass_pending is False
+    assert module._pending_room_ids == set()
+    module._record_trigger.assert_not_called()

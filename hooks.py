@@ -15,9 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-import shutil
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -35,7 +34,11 @@ from mindroom.private_instance_identity import (
     PrivateInstanceIdentityError,
     load_private_instance_identity,
 )
-from mindroom.thread_export import ThreadExportTarget, export_threads_to_targets_once
+from mindroom.thread_export import (
+    ThreadExportTarget,
+    clear_thread_export_root,
+    export_threads_to_targets_once,
+)
 from mindroom.tool_system.worker_routing import (
     agent_state_root_path,
     agent_workspace_root_path,
@@ -64,21 +67,26 @@ DEFAULT_PRIVATE_ROOM_SCOPE: PrivateRoomScope = "owner_and_agent"
 _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
 _full_pass_pending = False
+_pending_lock = threading.Lock()
 _wakeup: asyncio.Event | None = None
 _runner_loop: asyncio.AbstractEventLoop | None = None
 _latest_env: _TriggerEnv | None = None
 _private_instance_requesters: dict[tuple[str, Path], str] = {}
 _private_instance_requesters_lock = threading.Lock()
 _private_instance_requesters_revision = 0
+_live_hook_seen = False
 
 # Hot reload replaces this module but cannot interrupt a worker thread mid-pass, so the
-# single-flight lock and active token live on the long-lived core package. A module claims the
-# token only when a registered hook runs; staged imports leave the active module unchanged.
+# single-flight lock lives on the long-lived core package. The hook context's registry predicate
+# keeps staged or superseded modules from starting another pass.
 _EXPORT_PASS_LOCK: threading.Lock = thread_export_pkg.__dict__.setdefault(
     "_thread_export_plugin_pass_lock",
     threading.Lock(),
 )
-_EXPORT_PASS_TOKEN = object()
+
+
+def _always_active() -> bool:
+    return True
 
 
 @dataclass(frozen=True)
@@ -89,6 +97,7 @@ class _TriggerEnv:
     runtime_paths: RuntimePaths
     settings: Mapping[str, object]
     logger: BoundLogger
+    is_active: Callable[[], bool] = _always_active
 
 
 @dataclass(frozen=True)
@@ -139,12 +148,36 @@ def _requested_agents(
     return parsed
 
 
+def _requests_private_agents(ctx: HookContext) -> bool:
+    """Return whether current settings enable any configured private agent."""
+    return any(
+        agent_config is not None and agent_config.private is not None
+        for agent_name in _requested_agents(ctx.settings)
+        if (agent_config := ctx.config.agents.get(agent_name)) is not None
+    )
+
+
 def _debounce_seconds(settings: Mapping[str, object]) -> float:
     """Return the configured trigger debounce in seconds."""
     raw = settings.get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS)
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         return max(float(raw), 0.0)
     return DEFAULT_DEBOUNCE_SECONDS
+
+
+def _queue_full_pass() -> None:
+    """Queue full reconciliation and wake the runner from any thread."""
+    global _full_pass_pending  # noqa: PLW0603
+    with _pending_lock:
+        _full_pass_pending = True
+    if _runner_loop is not None and _wakeup is not None:
+        _runner_loop.call_soon_threadsafe(_wakeup.set)
+
+
+def _queue_room(room_id: str) -> None:
+    """Queue one dirty room without racing the runner's pending-work drain."""
+    with _pending_lock:
+        _pending_room_ids.add(room_id)
 
 
 def _private_instance_requester(
@@ -202,14 +235,13 @@ def _private_instance_requesters_for_requester(
         )
         if state_root is None or not state_root.is_dir() or state_root.is_symlink():
             continue
-        resolved_root = state_root.resolve()
         if (
             _private_instance_requester(
-                env, agent_name, agent_config.private.per, resolved_root
+                env, agent_name, agent_config.private.per, state_root
             )
             == requester_id
         ):
-            resolved[(agent_name, resolved_root)] = requester_id
+            resolved[(agent_name, state_root)] = requester_id
     return resolved
 
 
@@ -218,35 +250,33 @@ def _remember_private_instance_requester(
     requester_id: str,
 ) -> None:
     """Remember core-authorized private roots observed by one hook."""
-    global _full_pass_pending, _private_instance_requesters_revision  # noqa: PLW0603
-    discovered = _private_instance_requesters_for_requester(ctx, requester_id)
-    if not discovered:
-        return
-    with _private_instance_requesters_lock:
-        if all(
-            _private_instance_requesters.get(state_root) == owner
-            for state_root, owner in discovered.items()
-        ):
-            return
-        _private_instance_requesters.update(discovered)
-        _private_instance_requesters_revision += 1
-        _full_pass_pending = True
-
-
-def _prune_private_instance_requesters(ctx: HookContext) -> None:
-    """Drop cached private roots that no longer validate against core metadata."""
     global _private_instance_requesters_revision  # noqa: PLW0603
+    discovered = _private_instance_requesters_for_requester(ctx, requester_id)
+    if not ctx.is_active():
+        return
+    enabled_agent_names = set(_requested_agents(ctx.settings))
     with _private_instance_requesters_lock:
-        cached = tuple(_private_instance_requesters.items())
-    retained: dict[tuple[str, Path], str] = {}
-    for cache_key, requester_id in cached:
-        if cache_key in _private_instance_requesters_for_requester(ctx, requester_id):
-            retained[cache_key] = requester_id
-    with _private_instance_requesters_lock:
-        if retained != _private_instance_requesters:
-            _private_instance_requesters.clear()
-            _private_instance_requesters.update(retained)
-            _private_instance_requesters_revision += 1
+        updated = {
+            cache_key: owner
+            for cache_key, owner in _private_instance_requesters.items()
+            if not (owner == requester_id and cache_key[0] in enabled_agent_names)
+        }
+        updated.update(discovered)
+        if updated == _private_instance_requesters:
+            return
+        _private_instance_requesters.clear()
+        _private_instance_requesters.update(updated)
+        _private_instance_requesters_revision += 1
+    _queue_full_pass()
+
+
+async def _refresh_private_instance_requester(
+    ctx: HookContext,
+    requester_id: str,
+) -> None:
+    """Refresh one private requester without blocking the runtime event loop."""
+    if _requests_private_agents(ctx):
+        await asyncio.to_thread(_remember_private_instance_requester, ctx, requester_id)
 
 
 def _record_trigger(ctx: HookContext) -> None:
@@ -257,6 +287,7 @@ def _record_trigger(ctx: HookContext) -> None:
         runtime_paths=ctx.runtime_paths,
         settings=ctx.settings,
         logger=ctx.logger,
+        is_active=ctx.is_active,
     )
     if _wakeup is None:
         _wakeup = asyncio.Event()
@@ -268,20 +299,25 @@ def _record_trigger(ctx: HookContext) -> None:
     _wakeup.set()
 
 
-def _activate_export_pass_token() -> None:
-    """Claim the long-lived pass token when this module receives a live hook."""
-    thread_export_pkg.__dict__["_thread_export_plugin_active_pass_token"] = (
-        _EXPORT_PASS_TOKEN
-    )
+def _accept_live_hook(ctx: HookContext) -> bool:
+    """Accept hooks only from the published registry and reconcile on first use."""
+    global _live_hook_seen  # noqa: PLW0603
+    if not ctx.is_active():
+        return False
+    if not _live_hook_seen:
+        _live_hook_seen = True
+        _queue_full_pass()
+    return True
 
 
 def _drain_pending() -> tuple[bool, frozenset[str]]:
     """Atomically consume the pending full-pass flag and dirty room set."""
     global _full_pass_pending  # noqa: PLW0603
-    full_pass = _full_pass_pending
-    _full_pass_pending = False
-    room_ids = frozenset(_pending_room_ids)
-    _pending_room_ids.clear()
+    with _pending_lock:
+        full_pass = _full_pass_pending
+        _full_pass_pending = False
+        room_ids = frozenset(_pending_room_ids)
+        _pending_room_ids.clear()
     return full_pass, room_ids
 
 
@@ -316,10 +352,7 @@ def _run_export_pass_blocking(
 ) -> None:
     """Run one export pass to completion on a private event loop in the calling thread."""
     with _EXPORT_PASS_LOCK:
-        if (
-            thread_export_pkg.__dict__.get("_thread_export_plugin_active_pass_token")
-            is not _EXPORT_PASS_TOKEN
-        ):
+        if not env.is_active():
             return
         asyncio.run(_run_export_pass(env, full_pass=full_pass, room_ids=room_ids))
 
@@ -368,12 +401,11 @@ def _discover_private_instance_requesters(
         for state_root in _private_instance_state_roots(
             env.runtime_paths.storage_root, agent_name
         ):
-            resolved_root = state_root.resolve()
             requester_id = _private_instance_requester(
-                env, agent_name, agent_config.private.per, resolved_root
+                env, agent_name, agent_config.private.per, state_root
             )
             if requester_id is not None:
-                discovered[(agent_name, resolved_root)] = requester_id
+                discovered[(agent_name, state_root)] = requester_id
     return discovered
 
 
@@ -391,20 +423,20 @@ def _replace_private_instance_requesters(
         return True
 
 
-def _queue_full_pass_after_stale_snapshot() -> None:
-    """Queue a fresh pass after a hook invalidates a worker-thread snapshot."""
-    global _full_pass_pending  # noqa: PLW0603
-    _full_pass_pending = True
-    if _runner_loop is not None and _wakeup is not None:
-        _runner_loop.call_soon_threadsafe(_wakeup.set)
-
-
-def _remove_export_tree(output_dir: Path) -> None:
-    """Remove one plugin-owned export tree when its scope is revoked."""
-    if output_dir.is_symlink() or output_dir.is_file():
-        output_dir.unlink()
-    elif output_dir.is_dir():
-        shutil.rmtree(output_dir)
+def _remove_export_tree(env: _TriggerEnv, output_dir: Path) -> None:
+    """Clear one anchored plugin-owned export target when its scope is revoked."""
+    if not env.is_active():
+        return
+    try:
+        clear_thread_export_root(
+            output_dir,
+            trusted_root=env.runtime_paths.storage_root,
+        )
+    except (OSError, RuntimeError):
+        env.logger.warning(
+            "Skipping unsafe thread export cleanup",
+            output_dir=str(output_dir),
+        )
 
 
 def _private_workspace_export_dir(
@@ -421,7 +453,11 @@ def _private_workspace_export_dir(
         )
     except ValueError:
         return None
-    return workspace.root / WORKSPACE_EXPORT_DIRNAME if workspace is not None else None
+    return (
+        workspace.lexical_root / WORKSPACE_EXPORT_DIRNAME
+        if workspace is not None
+        else None
+    )
 
 
 def _shared_agent_export_targets(
@@ -437,7 +473,7 @@ def _shared_agent_export_targets(
     )
     output_dir = workspace_dir / WORKSPACE_EXPORT_DIRNAME
     if agent_user_id is None:
-        _remove_export_tree(output_dir)
+        _remove_export_tree(env, output_dir)
         env.logger.warning(
             "Skipping shared agent without persisted Matrix account",
             agent_name=agent_name,
@@ -448,6 +484,7 @@ def _shared_agent_export_targets(
             output_dir=output_dir,
             required_member_user_ids=(agent_user_id,),
             include_invited_rooms=options.invited_rooms,
+            trusted_root=env.runtime_paths.storage_root,
         ),
     )
 
@@ -480,9 +517,7 @@ def _private_agent_export_targets(
     state_root_owners = tuple(
         (
             state_root,
-            _private_instance_requester(
-                env, agent_name, worker_scope, state_root.resolve()
-            ),
+            _private_instance_requester(env, agent_name, worker_scope, state_root),
         )
         for state_root in state_roots
     )
@@ -490,7 +525,7 @@ def _private_agent_export_targets(
         for state_root, _owner in state_root_owners:
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
-                _remove_export_tree(output_dir)
+                _remove_export_tree(env, output_dir)
         env.logger.warning(
             "Skipping private agent without persisted Matrix account",
             agent_name=agent_name,
@@ -500,12 +535,11 @@ def _private_agent_export_targets(
     for state_root, owner in state_root_owners:
         if owner is None or (
             not reconcile_instances
-            and private_instance_requesters.get((agent_name, state_root.resolve()))
-            != owner
+            and private_instance_requesters.get((agent_name, state_root)) != owner
         ):
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
-                _remove_export_tree(output_dir)
+                _remove_export_tree(env, output_dir)
             env.logger.warning(
                 "Skipping private instance without valid core identity",
                 agent_name=agent_name,
@@ -524,6 +558,7 @@ def _private_agent_export_targets(
                 output_dir=output_dir,
                 required_member_user_ids=required_member_user_ids,
                 include_invited_rooms=options.invited_rooms,
+                trusted_root=env.runtime_paths.storage_root,
             )
         )
     return tuple(targets)
@@ -575,20 +610,22 @@ def _cleanup_disabled_agent_exports(
             workspace_dir = agent_workspace_root_path(
                 env.runtime_paths.storage_root, agent_name
             )
-            _remove_export_tree(workspace_dir / WORKSPACE_EXPORT_DIRNAME)
+            _remove_export_tree(env, workspace_dir / WORKSPACE_EXPORT_DIRNAME)
             continue
         for state_root in _private_instance_state_roots(
             env.runtime_paths.storage_root, agent_name
         ):
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:
-                _remove_export_tree(output_dir)
+                _remove_export_tree(env, output_dir)
 
 
 async def _run_export_pass(
     env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
 ) -> None:
     """Export the dirty rooms (or everything) into every enabled agent's workspace."""
+    if not env.is_active():
+        return
     requested = _requested_agents(env.settings)
     enabled = {
         name: options
@@ -614,7 +651,7 @@ async def _run_export_pass(
         if not _replace_private_instance_requesters(
             private_instance_requesters, expected_revision=index_revision
         ):
-            _queue_full_pass_after_stale_snapshot()
+            _queue_full_pass()
     else:
         private_instance_requesters, _index_revision = (
             _private_instance_requesters_snapshot()
@@ -632,6 +669,8 @@ async def _run_export_pass(
     ]
     targets = tuple(target for _, target, _ in target_records)
     for room_filter in room_filters:
+        if not env.is_active():
+            return
         try:
             target_stats = await export_threads_to_targets_once(
                 config=env.config,
@@ -672,32 +711,31 @@ async def _run_export_pass(
 @hook(event="bot:ready", name="thread-export-startup", agents=(ROUTER_AGENT_NAME,))
 async def queue_initial_full_pass(ctx: AgentLifecycleContext) -> None:
     """Queue one full export pass once the router bot is ready."""
-    global _full_pass_pending  # noqa: PLW0603
-    _activate_export_pass_token()
-    _prune_private_instance_requesters(ctx)
-    _full_pass_pending = True
+    if not _accept_live_hook(ctx):
+        return
+    _queue_full_pass()
     _record_trigger(ctx)
 
 
 @hook(event="config:reloaded", name="thread-export-config-reloaded", timeout_ms=1000)
 async def queue_full_pass_after_config_reload(ctx: ConfigReloadedContext) -> None:
     """Queue a full pass after hot reload, including cleanup for removed agent settings."""
-    global _full_pass_pending  # noqa: PLW0603
-    _activate_export_pass_token()
-    _prune_private_instance_requesters(ctx)
-    _full_pass_pending = True
+    if not _accept_live_hook(ctx):
+        return
+    _queue_full_pass()
     _record_trigger(ctx)
 
 
 @hook(event="message:received", name="thread-export-on-message", timeout_ms=1000)
 async def queue_room_on_message(ctx: MessageReceivedContext) -> None:
     """Queue the message's room for re-export."""
-    _activate_export_pass_token()
     if not _requested_agents(ctx.settings):
         return
-    _remember_private_instance_requester(ctx, ctx.envelope.requester_id)
-    _pending_room_ids.add(ctx.envelope.room_id)
+    if not _accept_live_hook(ctx):
+        return
+    _queue_room(ctx.envelope.room_id)
     _record_trigger(ctx)
+    await _refresh_private_instance_requester(ctx, ctx.envelope.requester_id)
 
 
 @hook(
@@ -705,9 +743,10 @@ async def queue_room_on_message(ctx: MessageReceivedContext) -> None:
 )
 async def queue_room_after_response(ctx: AfterResponseContext) -> None:
     """Queue the responded room for re-export."""
-    _activate_export_pass_token()
     if not _requested_agents(ctx.settings):
         return
-    _remember_private_instance_requester(ctx, ctx.result.envelope.requester_id)
-    _pending_room_ids.add(ctx.result.envelope.room_id)
+    if not _accept_live_hook(ctx):
+        return
+    _queue_room(ctx.result.envelope.room_id)
     _record_trigger(ctx)
+    await _refresh_private_instance_requester(ctx, ctx.result.envelope.requester_id)

@@ -17,10 +17,10 @@ jobs:
   compatibility:
     permissions:
       contents: read
-    uses: mindroom-ai/mindroom/.github/workflows/plugin-ci.yml@51c670a3efac916317f50d688d3fc7a041aab8a2
+    uses: mindroom-ai/mindroom/.github/workflows/plugin-ci.yml@b89e7583ac219d4ff3ba458eaa117a9671130841
     with:
       plugin_repository: ${{ github.repository }}
       plugin_ref: ${{ github.sha }}
       artifact_name: thread-export-plugin
-      mindroom_ref: 51c670a3efac916317f50d688d3fc7a041aab8a2
+      mindroom_ref: b89e7583ac219d4ff3ba458eaa117a9671130841
       require_tests: true
