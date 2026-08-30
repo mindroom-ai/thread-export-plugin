@@ -535,7 +535,7 @@ def _agent_export_targets(
     *,
     options: _AgentExportSettings,
     reconcile_private_instances: bool,
-    private_instance_requesters: Mapping[Path, str],
+    private_instance_requesters: Mapping[tuple[str, Path], str],
 ) -> tuple[ThreadExportTarget, ...]:
     """Return shared or requester-private export targets for one configured agent."""
     agent_config = env.config.agents.get(agent_name)
