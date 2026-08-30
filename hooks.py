@@ -67,7 +67,7 @@ _full_pass_pending = False
 _wakeup: asyncio.Event | None = None
 _runner_loop: asyncio.AbstractEventLoop | None = None
 _latest_env: _TriggerEnv | None = None
-_private_instance_requesters: dict[Path, str] = {}
+_private_instance_requesters: dict[tuple[str, Path], str] = {}
 _private_instance_requesters_lock = threading.Lock()
 _private_instance_requesters_revision = 0
 
@@ -183,12 +183,12 @@ def _private_instance_requester(
 def _private_instance_requesters_for_requester(
     ctx: HookContext,
     requester_id: str,
-) -> dict[Path, str]:
+) -> dict[tuple[str, Path], str]:
     """Forward-resolve every enabled private root for one requester."""
     if _MATRIX_USER_ID_PATTERN.fullmatch(requester_id) is None:
         return {}
     env = _TriggerEnv(ctx.config, ctx.runtime_paths, ctx.settings, ctx.logger)
-    resolved: dict[Path, str] = {}
+    resolved: dict[tuple[str, Path], str] = {}
     for agent_name in _requested_agents(ctx.settings):
         agent_config = ctx.config.agents.get(agent_name)
         if agent_config is None or agent_config.private is None:
@@ -209,7 +209,7 @@ def _private_instance_requesters_for_requester(
             )
             == requester_id
         ):
-            resolved[resolved_root] = requester_id
+            resolved[(agent_name, resolved_root)] = requester_id
     return resolved
 
 
@@ -238,10 +238,10 @@ def _prune_private_instance_requesters(ctx: HookContext) -> None:
     global _private_instance_requesters_revision  # noqa: PLW0603
     with _private_instance_requesters_lock:
         cached = tuple(_private_instance_requesters.items())
-    retained: dict[Path, str] = {}
-    for state_root, requester_id in cached:
-        if state_root in _private_instance_requesters_for_requester(ctx, requester_id):
-            retained[state_root] = requester_id
+    retained: dict[tuple[str, Path], str] = {}
+    for cache_key, requester_id in cached:
+        if cache_key in _private_instance_requesters_for_requester(ctx, requester_id):
+            retained[cache_key] = requester_id
     with _private_instance_requesters_lock:
         if retained != _private_instance_requesters:
             _private_instance_requesters.clear()
@@ -350,7 +350,7 @@ def _private_instance_state_roots(
     )
 
 
-def _private_instance_requesters_snapshot() -> tuple[dict[Path, str], int]:
+def _private_instance_requesters_snapshot() -> tuple[dict[tuple[str, Path], str], int]:
     """Return the cached private-root index and its revision atomically."""
     with _private_instance_requesters_lock:
         return dict(_private_instance_requesters), _private_instance_requesters_revision
@@ -358,9 +358,9 @@ def _private_instance_requesters_snapshot() -> tuple[dict[Path, str], int]:
 
 def _discover_private_instance_requesters(
     env: _TriggerEnv, enabled_agent_names: set[str]
-) -> dict[Path, str]:
+) -> dict[tuple[str, Path], str]:
     """Discover every core-authorized private state root for enabled agents."""
-    discovered: dict[Path, str] = {}
+    discovered: dict[tuple[str, Path], str] = {}
     for agent_name in enabled_agent_names:
         agent_config = env.config.agents[agent_name]
         if agent_config.private is None:
@@ -373,12 +373,12 @@ def _discover_private_instance_requesters(
                 env, agent_name, agent_config.private.per, resolved_root
             )
             if requester_id is not None:
-                discovered[resolved_root] = requester_id
+                discovered[(agent_name, resolved_root)] = requester_id
     return discovered
 
 
 def _replace_private_instance_requesters(
-    discovered: dict[Path, str], *, expected_revision: int
+    discovered: dict[tuple[str, Path], str], *, expected_revision: int
 ) -> bool:
     """Publish a full-pass index only when no hook changed it during discovery."""
     global _private_instance_requesters_revision  # noqa: PLW0603
@@ -460,7 +460,7 @@ def _private_agent_export_targets(
     options: _AgentExportSettings,
     worker_scope: WorkerScope,
     reconcile_instances: bool,
-    private_instance_requesters: Mapping[Path, str],
+    private_instance_requesters: Mapping[tuple[str, Path], str],
 ) -> tuple[ThreadExportTarget, ...]:
     """Return membership-scoped private targets validated against core identity."""
     if reconcile_instances:
@@ -471,8 +471,10 @@ def _private_agent_export_targets(
         state_roots = tuple(
             sorted(
                 root
-                for root in private_instance_requesters
-                if root.is_dir() and not root.is_symlink()
+                for cached_agent_name, root in private_instance_requesters
+                if cached_agent_name == agent_name
+                and root.is_dir()
+                and not root.is_symlink()
             )
         )
     state_root_owners = tuple(
@@ -498,7 +500,8 @@ def _private_agent_export_targets(
     for state_root, owner in state_root_owners:
         if owner is None or (
             not reconcile_instances
-            and private_instance_requesters.get(state_root.resolve()) != owner
+            and private_instance_requesters.get((agent_name, state_root.resolve()))
+            != owner
         ):
             output_dir = _private_workspace_export_dir(env, agent_name, state_root)
             if output_dir is not None:

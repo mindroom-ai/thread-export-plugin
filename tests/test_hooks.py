@@ -1335,6 +1335,70 @@ async def test_incremental_pass_ignores_unresolved_private_instances(
 
 
 @pytest.mark.asyncio
+async def test_incremental_private_exports_ignore_other_agent_roots(
+    tmp_path: Path,
+) -> None:
+    """An incremental pass must not inspect another private agent's export tree."""
+    module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
+    requester_id = "@alice:hs"
+    config = Config(
+        agents={
+            "alpha": AgentConfig(
+                display_name="Alpha",
+                private=AgentPrivateConfig(per="user", root="private_workspace"),
+            ),
+            "beta": AgentConfig(
+                display_name="Beta",
+                private=AgentPrivateConfig(per="user", root="private_workspace"),
+            ),
+        },
+        administrators=[requester_id],
+    )
+    runtime_paths = RuntimePaths(
+        config_path=tmp_path / "config.yaml",
+        config_dir=tmp_path,
+        env_path=tmp_path / ".env",
+        storage_root=tmp_path,
+    )
+    alpha_root = _materialize_private_instance(
+        config, runtime_paths, requester_id, agent_name="alpha"
+    )
+    beta_root = _materialize_private_instance(
+        config, runtime_paths, requester_id, agent_name="beta"
+    )
+    beta_export_dir = beta_root / "private_workspace" / "thread_exports"
+    beta_export_dir.mkdir(parents=True)
+    (beta_export_dir / "sentinel.yaml").write_text("keep", encoding="utf-8")
+    logger = Mock()
+    module._remember_private_instance_requester(
+        SimpleNamespace(
+            config=config,
+            runtime_paths=runtime_paths,
+            settings={"agents": ["alpha", "beta"]},
+            logger=logger,
+        ),
+        requester_id,
+    )
+    env = module._TriggerEnv(
+        config=config,
+        runtime_paths=runtime_paths,
+        settings={"agents": {"alpha": {"private_room_scope": "owner"}}},
+        logger=logger,
+    )
+
+    await module._run_export_pass(
+        env, full_pass=False, room_ids=frozenset({"!changed:hs"})
+    )
+
+    assert (beta_export_dir / "sentinel.yaml").exists()
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.output_dir for target in targets) == (
+        alpha_root / "private_workspace" / "thread_exports",
+    )
+
+
+@pytest.mark.asyncio
 async def test_private_agent_owner_scope_requires_only_owner_membership(
     tmp_path: Path,
 ) -> None:
