@@ -25,7 +25,7 @@ When enabled for an agent, threads from every Matrix room that agent is currentl
 
 1. `bot:ready` (router) queues one full export pass at startup.
 2. `config:reloaded` queues a full pass after hot reload, including cleanup for agents removed from the plugin settings.
-3. `message:received` and `message:after_response` mark the affected room dirty.
+3. `message:received` and `message:after_response` mark the affected room dirty; newly discovered private roots promote the next pass to full reconciliation.
 4. A background runner debounces triggers, then reads each dirty room once and fans the result out only to enabled agents that are currently joined.
 5. Unchanged thread files are left untouched, while vanished threads and unauthorized room directories are removed.
 
@@ -35,8 +35,8 @@ When enabled for an agent, threads from every Matrix room that agent is currentl
 |------|-------|---------|
 | `thread-export-startup` | `bot:ready` | Queue one full export pass once the router is ready |
 | `thread-export-config-reloaded` | `config:reloaded` | Queue one full export pass after config hot reload |
-| `thread-export-on-message` | `message:received` | Mark the message's room dirty |
-| `thread-export-after-response` | `message:after_response` | Mark the responded room dirty |
+| `thread-export-on-message` | `message:received` | Queue the message's room, or a full pass for a newly discovered private root |
+| `thread-export-after-response` | `message:after_response` | Queue the responded room, or a full pass for a newly discovered private root |
 
 ## Settings
 
@@ -76,11 +76,11 @@ Private agents (`private:` config) are supported: every existing private instanc
 <storage_root>/private_instances/<worker scope>/<agent>/<private root>/thread_exports/...
 ```
 
-Instances are discovered on disk, so a brand-new requester's instance starts receiving exports from the first pass after the instance is created.
+Instances are discovered from their core identity records, so a brand-new requester's instance starts receiving exports after its runtime has been materialized.
 
 Shared-agent exports are scoped to the enabled agent's current room memberships.
 Private-instance exports are scoped to the owner's current memberships, so one requester's private workspace never accumulates other users' conversations.
-Instance owners are resolved by matching instance directories against Matrix user IDs from `administrators`, room invitation policies, responder `access.users`, canonical alias entries, and requesters observed by the message and response hooks. Only observed requesters with an existing enabled private instance are retained, and startup or config reload prunes identities whose instance no longer exists. An existing unlisted owner's instance starts receiving exports after that owner next sends a message. Instances whose owner cannot be resolved have their prior exports removed and are skipped with a warning in the logs.
+Each private instance is authorized only when its core identity record names a valid Matrix requester and forward-resolves to that instance's state root. The plugin retains only validated roots observed by message and response hooks; startup and configuration reload rebuild that bounded in-memory index from the core records. Missing, unreadable, malformed, or mismatched records remove prior exports and prevent new ones.
 Membership lookup failures block new exports for that room and are reported, while previously authorized files remain until a successful lookup definitively proves that access was revoked.
 
 ## Semantic Search Over Exports
@@ -120,6 +120,8 @@ Notes:
 - Add `exclude_patterns: ["*/index.json"]` to the knowledge base if you prefer to keep the room indexes out of the semantic index.
 
 ## Install
+
+Requires MindRoom v2026.8.136 or newer.
 
 Vendor this plugin with the MindRoom CLI:
 
