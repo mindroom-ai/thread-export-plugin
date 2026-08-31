@@ -121,6 +121,8 @@ Notes:
 
 ## Install
 
+Requires MindRoom v2026.8.136 or newer.
+
 Vendor this plugin with the MindRoom CLI:
 
 ```bash
