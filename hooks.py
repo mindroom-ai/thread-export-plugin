@@ -689,25 +689,35 @@ async def _run_export_pass(
         env.logger.warning(
             "thread-export settings list unknown agents", unknown_agents=list(unknown)
         )
-    room_filters: tuple[str | None, ...] = (
-        (None,) if full_pass else tuple(sorted(room_ids))
-    )
     if full_pass:
         _cleanup_disabled_agent_exports(env, set(enabled))
-        _cached_private_instance_requesters, index_revision = (
+        cached_private_instance_requesters, index_revision = (
             _private_instance_requesters_snapshot()
         )
-        private_instance_requesters = _discover_private_instance_requesters(
-            env, set(enabled)
-        )
-        if not _replace_private_instance_requesters(
-            private_instance_requesters, expected_revision=index_revision
-        ):
-            _queue_full_pass()
+        try:
+            private_instance_requesters = _discover_private_instance_requesters(
+                env, set(enabled)
+            )
+        except Exception:
+            if not room_ids:
+                raise
+            env.logger.exception(
+                "Private instance reconciliation failed; exporting dirty rooms"
+            )
+            full_pass = False
+            private_instance_requesters = cached_private_instance_requesters
+        else:
+            if not _replace_private_instance_requesters(
+                private_instance_requesters, expected_revision=index_revision
+            ):
+                _queue_full_pass()
     else:
         private_instance_requesters, _index_revision = (
             _private_instance_requesters_snapshot()
         )
+    room_filters: tuple[str | None, ...] = (
+        (None,) if full_pass else tuple(sorted(room_ids))
+    )
     target_records = [
         (agent_name, target, options)
         for agent_name, options in enabled.items()

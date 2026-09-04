@@ -1973,6 +1973,59 @@ async def test_promoted_full_scan_failure_does_not_lose_dirty_room(
 
 
 @pytest.mark.asyncio
+async def test_room_arriving_during_export_survives_pending_full_pass_failure(
+    tmp_path: Path,
+) -> None:
+    """A later dirty room must not be swallowed by a failed full reconciliation."""
+    module = _load_hooks_module()
+    module._live_hook_seen = True
+    first_export_started = threading.Event()
+    release_first_export = threading.Event()
+
+    async def block_first_export(
+        *, targets: tuple[object, ...], **_kwargs: object
+    ) -> tuple[Mock, ...]:
+        if not first_export_started.is_set():
+            first_export_started.set()
+            await asyncio.to_thread(release_first_export.wait)
+        return _target_stats(targets=targets)
+
+    _autospec_export(module, side_effect=block_first_export)
+    module._discover_private_instance_requesters = Mock(
+        side_effect=OSError("unavailable")
+    )
+    requester_id = "@requester:hs"
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+    )
+
+    def context(room_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            envelope=SimpleNamespace(room_id=room_id, requester_id=requester_id),
+            config=config,
+            runtime_paths=runtime_paths,
+            settings=_settings(["secret"]),
+            logger=Mock(),
+            is_active=lambda: True,
+        )
+
+    await module.queue_room_on_message(context("!first:hs"))
+    assert await asyncio.to_thread(first_export_started.wait, 1)
+    await module.queue_room_on_message(context("!second:hs"))
+    release_first_export.set()
+    await _drain(module)
+
+    room_filters = [
+        call.kwargs["room_filter"]
+        for call in module.export_threads_to_targets_once.await_args_list
+    ]
+    assert room_filters == ["!first:hs", "!second:hs"]
+    await _shutdown_runner(module)
+
+
+@pytest.mark.asyncio
 async def test_first_live_hook_after_source_reload_queues_full_pass(
     tmp_path: Path,
 ) -> None:
