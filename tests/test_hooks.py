@@ -1821,6 +1821,7 @@ async def test_message_hooks_return_before_private_identity_discovery_finishes(
 ) -> None:
     """Message hooks must not wait for private identity filesystem reads."""
     module = _load_hooks_module()
+    module._live_hook_seen = True
     _autospec_export(module, side_effect=_target_stats)
     requester_id = "@requester:hs"
     config, runtime_paths, _instance_roots = _private_runtime(
@@ -1921,6 +1922,18 @@ async def test_private_identity_discovery_failure_does_not_stop_runner(
     )
     assert not module._runner_tasks["runner"].done()
     await _shutdown_runner(module)
+
+
+def test_requester_queue_overflow_promotes_full_reconciliation() -> None:
+    """Too many distinct requesters must coalesce into one bounded full pass."""
+    module = _load_hooks_module()
+
+    for index in range(module._MAX_PENDING_PRIVATE_REQUESTERS):
+        module._queue_private_instance_requester(f"@requester-{index}:hs")
+    module._queue_private_instance_requester("@overflow:hs")
+
+    assert module._pending_private_requester_ids == set()
+    assert module._full_pass_pending is True
 
 
 @pytest.mark.asyncio

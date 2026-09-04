@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 WORKSPACE_EXPORT_DIRNAME = "thread_exports"
 PRIVATE_INSTANCES_DIRNAME = "private_instances"
 DEFAULT_DEBOUNCE_SECONDS = 2.0
+_MAX_PENDING_PRIVATE_REQUESTERS = 1024
 _MATRIX_USER_ID_PATTERN = re.compile(r"@[^:\s]+:\S+")
 
 type PrivateRoomScope = Literal["owner", "owner_and_agent"]
@@ -183,8 +184,15 @@ def _queue_room(room_id: str) -> None:
 
 def _queue_private_instance_requester(requester_id: str) -> None:
     """Queue one requester for private-instance discovery by the runner."""
+    global _full_pass_pending  # noqa: PLW0603
     with _pending_lock:
-        _pending_private_requester_ids.add(requester_id)
+        if _full_pass_pending or requester_id in _pending_private_requester_ids:
+            return
+        if len(_pending_private_requester_ids) >= _MAX_PENDING_PRIVATE_REQUESTERS:
+            _pending_private_requester_ids.clear()
+            _full_pass_pending = True
+        else:
+            _pending_private_requester_ids.add(requester_id)
 
 
 def _private_instance_requester(
