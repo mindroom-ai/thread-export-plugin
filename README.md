@@ -1,5 +1,8 @@
 # Thread Export
 
+> [!IMPORTANT]
+> **This plugin is archived.** Thread exports are now built into [MindRoom](https://github.com/mindroom-ai/mindroom): set `thread_exports: true` on any agent in `config.yaml`, or pass `invited_rooms` / `private_room_scope` as a mapping (see the [agent configuration docs](https://docs.mindroom.chat/configuration/agents/#thread-exports)). The upstreaming change is [mindroom-ai/mindroom#1954](https://github.com/mindroom-ai/mindroom/pull/1954). To migrate, remove this plugin from `plugins:` and enable `thread_exports` on the agents that were listed under the plugin's `agents` setting; the two per-agent options keep their names, and the `debounce_seconds` setting is gone (fixed at two seconds). MindRoom releases that include that change no longer export `private_instance_state_root_for_requester`, so this plugin fails to import there and MindRoom rejects a config that still lists it; migrate before upgrading. This repository is kept read-only for reference.
+
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-plugins-blue)](https://docs.mindroom.chat/plugins/)
 [![Hooks](https://img.shields.io/badge/docs-hooks-blue)](https://docs.mindroom.chat/hooks/)
