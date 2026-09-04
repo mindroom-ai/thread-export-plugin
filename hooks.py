@@ -354,27 +354,34 @@ async def _run_export_loop() -> None:
             await asyncio.sleep(debounce)
         full_pass, room_ids = _drain_pending()
         requester_ids = _drain_pending_private_requesters()
-        if requester_ids:
-            await asyncio.to_thread(
-                _refresh_private_instance_requesters, env, requester_ids
-            )
-        if not full_pass and not room_ids:
+        if not full_pass and not room_ids and not requester_ids:
             continue
         env = _latest_env or env
         try:
             await asyncio.to_thread(
-                _run_export_pass_blocking, env, full_pass=full_pass, room_ids=room_ids
+                _run_export_pass_blocking,
+                env,
+                full_pass=full_pass,
+                room_ids=room_ids,
+                requester_ids=requester_ids,
             )
         except Exception:
             env.logger.exception("Thread export pass crashed")
 
 
 def _run_export_pass_blocking(
-    env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
+    env: _TriggerEnv,
+    *,
+    full_pass: bool,
+    room_ids: frozenset[str],
+    requester_ids: frozenset[str] = frozenset(),
 ) -> None:
     """Run one export pass to completion on a private event loop in the calling thread."""
     with _EXPORT_PASS_LOCK:
         if not env.is_active():
+            return
+        _refresh_private_instance_requesters(env, requester_ids)
+        if not full_pass and not room_ids:
             return
         asyncio.run(_run_export_pass(env, full_pass=full_pass, room_ids=room_ids))
 

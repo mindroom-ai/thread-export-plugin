@@ -1862,15 +1862,21 @@ async def test_message_hooks_return_before_private_identity_discovery_finishes(
         else module.queue_room_after_response
     )
     hook_task = asyncio.create_task(hook(ctx))
+    drain_task: asyncio.Task[None] | None = None
     try:
         assert await asyncio.to_thread(discovery_started.wait, 1)
         await asyncio.wait_for(asyncio.shield(hook_task), timeout=0.05)
         assert not discovery_finished.is_set()
+        drain_task = asyncio.create_task(_drain(module))
+        await asyncio.sleep(0.02)
+        assert not drain_task.done()
     finally:
         release_discovery.set()
         with contextlib.suppress(asyncio.CancelledError):
             await hook_task
-        await _drain(module)
+        if drain_task is None:
+            drain_task = asyncio.create_task(_drain(module))
+        await drain_task
         await _shutdown_runner(module)
     targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
     assert tuple(target.required_member_user_ids for target in targets) == (
