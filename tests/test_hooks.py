@@ -1918,6 +1918,42 @@ async def test_private_identity_discovery_failure_does_not_stop_runner(
 
 
 @pytest.mark.asyncio
+async def test_promoted_full_scan_failure_does_not_lose_dirty_room(
+    tmp_path: Path,
+) -> None:
+    """A failed follow-up reconciliation must not suppress the dirty-room export."""
+    module = _load_hooks_module()
+    module._live_hook_seen = True
+    _autospec_export(module, side_effect=_target_stats)
+    module._discover_private_instance_requesters = Mock(
+        side_effect=OSError("unavailable")
+    )
+    requester_id = "@requester:hs"
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path,
+        (requester_id,),
+        persist_agent_identity=True,
+    )
+    ctx = SimpleNamespace(
+        envelope=SimpleNamespace(room_id="!room:hs", requester_id=requester_id),
+        config=config,
+        runtime_paths=runtime_paths,
+        settings=_settings(["secret"]),
+        logger=Mock(),
+        is_active=lambda: True,
+    )
+
+    await module.queue_room_on_message(ctx)
+    await _drain(module)
+
+    module.export_threads_to_targets_once.assert_awaited_once()
+    assert module.export_threads_to_targets_once.await_args.kwargs["room_filter"] == (
+        "!room:hs"
+    )
+    await _shutdown_runner(module)
+
+
+@pytest.mark.asyncio
 async def test_first_live_hook_after_source_reload_queues_full_pass(
     tmp_path: Path,
 ) -> None:

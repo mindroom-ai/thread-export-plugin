@@ -352,12 +352,12 @@ async def _run_export_loop() -> None:
         debounce = _debounce_seconds(env.settings)
         if debounce > 0:
             await asyncio.sleep(debounce)
+        full_pass, room_ids = _drain_pending()
         requester_ids = _drain_pending_private_requesters()
         if requester_ids:
             await asyncio.to_thread(
                 _refresh_private_instance_requesters, env, requester_ids
             )
-        full_pass, room_ids = _drain_pending()
         if not full_pass and not room_ids:
             continue
         env = _latest_env or env
