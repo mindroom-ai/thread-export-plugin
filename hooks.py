@@ -1,9 +1,9 @@
 # ruff: noqa: INP001
 """Automatically export Matrix threads to YAML in enabled agents' workspaces.
 
-Message hooks only record which room changed; one module-global runner task debounces triggers and
-runs journal-backed export passes into every enabled agent's workspace, so bursts coalesce and at
-most one pass runs at a time.
+Message hooks only record which room changed and which requester triggered it; one module-global
+runner task debounces triggers and runs journal-backed export passes into every enabled agent's
+workspace, so bursts coalesce and at most one pass runs at a time.
 Each pass executes on a private event loop in a worker thread: export reconciliation re-reads and
 re-parses every exported thread YAML synchronously, which blocked the runtime loop for over five
 seconds per pass (``event_loop_stall_detected``) when run inline.
@@ -66,6 +66,7 @@ DEFAULT_PRIVATE_ROOM_SCOPE: PrivateRoomScope = "owner_and_agent"
 
 _runner_tasks: dict[str, asyncio.Task[None]] = {}
 _pending_room_ids: set[str] = set()
+_pending_private_requester_ids: set[str] = set()
 _full_pass_pending = False
 _pending_lock = threading.Lock()
 _wakeup: asyncio.Event | None = None
@@ -148,7 +149,7 @@ def _requested_agents(
     return parsed
 
 
-def _requests_private_agents(ctx: HookContext) -> bool:
+def _requests_private_agents(ctx: HookContext | _TriggerEnv) -> bool:
     """Return whether current settings enable any configured private agent."""
     return any(
         agent_config is not None and agent_config.private is not None
@@ -178,6 +179,12 @@ def _queue_room(room_id: str) -> None:
     """Queue one dirty room without racing the runner's pending-work drain."""
     with _pending_lock:
         _pending_room_ids.add(room_id)
+
+
+def _queue_private_instance_requester(requester_id: str) -> None:
+    """Queue one requester for private-instance discovery by the runner."""
+    with _pending_lock:
+        _pending_private_requester_ids.add(requester_id)
 
 
 def _private_instance_requester(
@@ -214,7 +221,7 @@ def _private_instance_requester(
 
 
 def _private_instance_requesters_for_requester(
-    ctx: HookContext,
+    ctx: HookContext | _TriggerEnv,
     requester_id: str,
 ) -> dict[tuple[str, Path], str]:
     """Forward-resolve every enabled private root for one requester."""
@@ -246,7 +253,7 @@ def _private_instance_requesters_for_requester(
 
 
 def _remember_private_instance_requester(
-    ctx: HookContext,
+    ctx: HookContext | _TriggerEnv,
     requester_id: str,
 ) -> None:
     """Remember core-authorized private roots observed by one hook."""
@@ -268,15 +275,6 @@ def _remember_private_instance_requester(
         _private_instance_requesters.update(updated)
         _private_instance_requesters_revision += 1
     _queue_full_pass()
-
-
-async def _refresh_private_instance_requester(
-    ctx: HookContext,
-    requester_id: str,
-) -> None:
-    """Refresh one private requester without blocking the runtime event loop."""
-    if _requests_private_agents(ctx):
-        await asyncio.to_thread(_remember_private_instance_requester, ctx, requester_id)
 
 
 def _record_trigger(ctx: HookContext) -> None:
@@ -321,6 +319,25 @@ def _drain_pending() -> tuple[bool, frozenset[str]]:
     return full_pass, room_ids
 
 
+def _drain_pending_private_requesters() -> frozenset[str]:
+    """Atomically consume requesters waiting for private-instance discovery."""
+    with _pending_lock:
+        requester_ids = frozenset(_pending_private_requester_ids)
+        _pending_private_requester_ids.clear()
+    return requester_ids
+
+
+def _refresh_private_instance_requesters(
+    env: _TriggerEnv, requester_ids: frozenset[str]
+) -> None:
+    """Refresh queued private requesters in the runner's worker thread."""
+    for requester_id in sorted(requester_ids):
+        try:
+            _remember_private_instance_requester(env, requester_id)
+        except Exception:
+            env.logger.exception("Private instance discovery failed")
+
+
 async def _run_export_loop() -> None:
     """Drain export triggers one debounced single-flight pass at a time."""
     global _runner_loop  # noqa: PLW0603
@@ -336,23 +353,35 @@ async def _run_export_loop() -> None:
         if debounce > 0:
             await asyncio.sleep(debounce)
         full_pass, room_ids = _drain_pending()
-        if not full_pass and not room_ids:
+        requester_ids = _drain_pending_private_requesters()
+        if not full_pass and not room_ids and not requester_ids:
             continue
         env = _latest_env or env
         try:
             await asyncio.to_thread(
-                _run_export_pass_blocking, env, full_pass=full_pass, room_ids=room_ids
+                _run_export_pass_blocking,
+                env,
+                full_pass=full_pass,
+                room_ids=room_ids,
+                requester_ids=requester_ids,
             )
         except Exception:
             env.logger.exception("Thread export pass crashed")
 
 
 def _run_export_pass_blocking(
-    env: _TriggerEnv, *, full_pass: bool, room_ids: frozenset[str]
+    env: _TriggerEnv,
+    *,
+    full_pass: bool,
+    room_ids: frozenset[str],
+    requester_ids: frozenset[str] = frozenset(),
 ) -> None:
     """Run one export pass to completion on a private event loop in the calling thread."""
     with _EXPORT_PASS_LOCK:
         if not env.is_active():
+            return
+        _refresh_private_instance_requesters(env, requester_ids)
+        if not full_pass and not room_ids:
             return
         asyncio.run(_run_export_pass(env, full_pass=full_pass, room_ids=room_ids))
 
@@ -652,25 +681,35 @@ async def _run_export_pass(
         env.logger.warning(
             "thread-export settings list unknown agents", unknown_agents=list(unknown)
         )
-    room_filters: tuple[str | None, ...] = (
-        (None,) if full_pass else tuple(sorted(room_ids))
-    )
     if full_pass:
         _cleanup_disabled_agent_exports(env, set(enabled))
-        _cached_private_instance_requesters, index_revision = (
+        cached_private_instance_requesters, index_revision = (
             _private_instance_requesters_snapshot()
         )
-        private_instance_requesters = _discover_private_instance_requesters(
-            env, set(enabled)
-        )
-        if not _replace_private_instance_requesters(
-            private_instance_requesters, expected_revision=index_revision
-        ):
-            _queue_full_pass()
+        try:
+            private_instance_requesters = _discover_private_instance_requesters(
+                env, set(enabled)
+            )
+        except Exception:
+            if not room_ids:
+                raise
+            env.logger.exception(
+                "Private instance reconciliation failed; exporting dirty rooms"
+            )
+            full_pass = False
+            private_instance_requesters = cached_private_instance_requesters
+        else:
+            if not _replace_private_instance_requesters(
+                private_instance_requesters, expected_revision=index_revision
+            ):
+                _queue_full_pass()
     else:
         private_instance_requesters, _index_revision = (
             _private_instance_requesters_snapshot()
         )
+    room_filters: tuple[str | None, ...] = (
+        (None,) if full_pass else tuple(sorted(room_ids))
+    )
     target_records = [
         (agent_name, target, options)
         for agent_name, options in enabled.items()
@@ -749,8 +788,9 @@ async def queue_room_on_message(ctx: MessageReceivedContext) -> None:
     if not _accept_live_hook(ctx):
         return
     _queue_room(ctx.envelope.room_id)
+    if _requests_private_agents(ctx):
+        _queue_private_instance_requester(ctx.envelope.requester_id)
     _record_trigger(ctx)
-    await _refresh_private_instance_requester(ctx, ctx.envelope.requester_id)
 
 
 @hook(
@@ -763,5 +803,6 @@ async def queue_room_after_response(ctx: AfterResponseContext) -> None:
     if not _accept_live_hook(ctx):
         return
     _queue_room(ctx.result.envelope.room_id)
+    if _requests_private_agents(ctx):
+        _queue_private_instance_requester(ctx.result.envelope.requester_id)
     _record_trigger(ctx)
-    await _refresh_private_instance_requester(ctx, ctx.result.envelope.requester_id)
