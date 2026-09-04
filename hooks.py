@@ -186,7 +186,7 @@ def _queue_private_instance_requester(requester_id: str) -> None:
     """Queue one requester for private-instance discovery by the runner."""
     global _full_pass_pending  # noqa: PLW0603
     with _pending_lock:
-        if _full_pass_pending or requester_id in _pending_private_requester_ids:
+        if requester_id in _pending_private_requester_ids:
             return
         if len(_pending_private_requester_ids) >= _MAX_PENDING_PRIVATE_REQUESTERS:
             _pending_private_requester_ids.clear()

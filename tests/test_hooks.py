@@ -1942,7 +1942,6 @@ async def test_promoted_full_scan_failure_does_not_lose_dirty_room(
 ) -> None:
     """A failed follow-up reconciliation must not suppress the dirty-room export."""
     module = _load_hooks_module()
-    module._live_hook_seen = True
     _autospec_export(module, side_effect=_target_stats)
     module._discover_private_instance_requesters = Mock(
         side_effect=OSError("unavailable")
@@ -1968,6 +1967,10 @@ async def test_promoted_full_scan_failure_does_not_lose_dirty_room(
     module.export_threads_to_targets_once.assert_awaited_once()
     assert module.export_threads_to_targets_once.await_args.kwargs["room_filter"] == (
         "!room:hs"
+    )
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (requester_id, "@mindroom_secret:localhost"),
     )
     await _shutdown_runner(module)
 
