@@ -25,8 +25,8 @@ When enabled for an agent, threads from every Matrix room that agent is currentl
 
 1. `bot:ready` (router) queues one full export pass at startup.
 2. `config:reloaded` queues a full pass after hot reload, including cleanup for agents removed from the plugin settings.
-3. `message:received` and `message:after_response` mark the affected room dirty; newly discovered private roots promote the next pass to full reconciliation.
-4. A background runner debounces triggers, then reads each dirty room once and fans the result out only to enabled agents that are currently joined.
+3. `message:received` and `message:after_response` enqueue the affected room and requester without waiting for filesystem access.
+4. A background runner debounces triggers, discovers private roots, then reads each dirty room once and fans the result out only to enabled agents that are currently joined.
 5. Unchanged thread files are left untouched, while vanished threads and unauthorized room directories are removed.
 
 ## Hooks

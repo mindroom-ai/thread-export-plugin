@@ -8,7 +8,6 @@ import contextlib
 import inspect
 import sys
 import threading
-import time
 from importlib import util
 from pathlib import Path
 from types import SimpleNamespace
@@ -276,6 +275,7 @@ async def _drain(module: ModuleType, cycles: int = 400) -> None:
         idle = (
             not module._full_pass_pending
             and not module._pending_room_ids
+            and not module._pending_private_requester_ids
             and not module._EXPORT_PASS_LOCK.locked()
             and (wakeup is None or not wakeup.is_set())
         )
@@ -1815,12 +1815,13 @@ def test_full_pass_queued_while_pending_work_drains_is_not_lost() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("hook_name", ["message", "after_response"])
-async def test_message_hooks_offload_private_identity_discovery(
+async def test_message_hooks_return_before_private_identity_discovery_finishes(
     tmp_path: Path,
     hook_name: str,
 ) -> None:
-    """Private identity filesystem reads must not stall the runtime event loop."""
+    """Message hooks must not wait for private identity filesystem reads."""
     module = _load_hooks_module()
+    _autospec_export(module, side_effect=_target_stats)
     requester_id = "@requester:hs"
     config, runtime_paths, _instance_roots = _private_runtime(
         tmp_path,
@@ -1843,84 +1844,77 @@ async def test_message_hooks_offload_private_identity_discovery(
     )
     original_discovery = module._private_instance_requesters_for_requester
     discovery_started = threading.Event()
-
-    def delayed_discovery(*args: object, **kwargs: object) -> object:
-        discovery_started.set()
-        time.sleep(0.2)
-        return original_discovery(*args, **kwargs)
-
-    module._private_instance_requesters_for_requester = delayed_discovery
-    module._record_trigger = Mock()
-    hook = (
-        module.queue_room_on_message
-        if hook_name == "message"
-        else module.queue_room_after_response
-    )
-    started = time.monotonic()
-    hook_task = asyncio.create_task(hook(ctx))
-
-    await asyncio.sleep(0.02)
-    heartbeat_delay = time.monotonic() - started
-    await hook_task
-
-    assert discovery_started.is_set()
-    assert heartbeat_delay < 0.1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("hook_name", ["message", "after_response"])
-async def test_slow_private_discovery_cannot_lose_trigger(
-    tmp_path: Path,
-    hook_name: str,
-) -> None:
-    """A timed-out discovery still leaves queued room and reconciliation work."""
-    module = _load_hooks_module()
-    requester_id = "@requester:hs"
-    config, runtime_paths, _instance_roots = _private_runtime(
-        tmp_path,
-        (requester_id,),
-        persist_agent_identity=True,
-    )
-    settings = _settings(["secret"])
-    common = {
-        "config": config,
-        "runtime_paths": runtime_paths,
-        "settings": settings,
-        "logger": Mock(),
-        "is_active": lambda: True,
-    }
-    envelope = SimpleNamespace(room_id="!room:hs", requester_id=requester_id)
-    ctx = (
-        SimpleNamespace(envelope=envelope, **common)
-        if hook_name == "message"
-        else SimpleNamespace(result=SimpleNamespace(envelope=envelope), **common)
-    )
-    original_discovery = module._private_instance_requesters_for_requester
+    release_discovery = threading.Event()
     discovery_finished = threading.Event()
 
     def delayed_discovery(*args: object, **kwargs: object) -> object:
-        time.sleep(0.2)
-        result = original_discovery(*args, **kwargs)
-        discovery_finished.set()
-        return result
+        discovery_started.set()
+        assert release_discovery.wait(1)
+        try:
+            return original_discovery(*args, **kwargs)
+        finally:
+            discovery_finished.set()
 
     module._private_instance_requesters_for_requester = delayed_discovery
-    module._record_trigger = Mock()
-    module._queue_full_pass = Mock(wraps=module._queue_full_pass)
-    module._live_hook_seen = True
     hook = (
         module.queue_room_on_message
         if hook_name == "message"
         else module.queue_room_after_response
     )
+    hook_task = asyncio.create_task(hook(ctx))
+    try:
+        assert await asyncio.to_thread(discovery_started.wait, 1)
+        await asyncio.wait_for(asyncio.shield(hook_task), timeout=0.05)
+        assert not discovery_finished.is_set()
+    finally:
+        release_discovery.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hook_task
+        await _drain(module)
+        await _shutdown_runner(module)
+    targets = module.export_threads_to_targets_once.await_args.kwargs["targets"]
+    assert tuple(target.required_member_user_ids for target in targets) == (
+        (requester_id, "@mindroom_secret:localhost"),
+    )
+    assert (
+        module.export_threads_to_targets_once.await_args.kwargs["room_filter"] is None
+    )
 
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(hook(ctx), timeout=0.05)
 
-    assert module._pending_room_ids == {"!room:hs"}
-    module._record_trigger.assert_called_once_with(ctx)
-    assert await asyncio.to_thread(discovery_finished.wait, 1)
-    module._queue_full_pass.assert_called()
+@pytest.mark.asyncio
+async def test_private_identity_discovery_failure_does_not_stop_runner(
+    tmp_path: Path,
+) -> None:
+    """A failed requester lookup must not block the queued room export."""
+    module = _load_hooks_module()
+    module._live_hook_seen = True
+    _autospec_export(module, side_effect=_target_stats)
+    module._private_instance_requesters_for_requester = Mock(
+        side_effect=OSError("unavailable")
+    )
+    config, runtime_paths, _instance_roots = _private_runtime(
+        tmp_path,
+        ("@requester:hs",),
+        persist_agent_identity=True,
+    )
+    ctx = SimpleNamespace(
+        envelope=SimpleNamespace(room_id="!room:hs", requester_id="@requester:hs"),
+        config=config,
+        runtime_paths=runtime_paths,
+        settings=_settings(["secret"]),
+        logger=Mock(),
+        is_active=lambda: True,
+    )
+
+    await module.queue_room_on_message(ctx)
+    await _drain(module)
+
+    module.export_threads_to_targets_once.assert_awaited_once()
+    assert module.export_threads_to_targets_once.await_args.kwargs["room_filter"] == (
+        "!room:hs"
+    )
+    assert not module._runner_tasks["runner"].done()
+    await _shutdown_runner(module)
 
 
 @pytest.mark.asyncio
