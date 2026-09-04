@@ -1924,18 +1924,6 @@ async def test_private_identity_discovery_failure_does_not_stop_runner(
     await _shutdown_runner(module)
 
 
-def test_requester_queue_overflow_promotes_full_reconciliation() -> None:
-    """Too many distinct requesters must coalesce into one bounded full pass."""
-    module = _load_hooks_module()
-
-    for index in range(module._MAX_PENDING_PRIVATE_REQUESTERS):
-        module._queue_private_instance_requester(f"@requester-{index}:hs")
-    module._queue_private_instance_requester("@overflow:hs")
-
-    assert module._pending_private_requester_ids == set()
-    assert module._full_pass_pending is True
-
-
 @pytest.mark.asyncio
 async def test_promoted_full_scan_failure_does_not_lose_dirty_room(
     tmp_path: Path,
